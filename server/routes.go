@@ -242,7 +242,10 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				resp.LoadDuration = checkpointLoaded.Sub(checkpointStart)
 
 				if !req.Raw {
-					p, err := Prompt(req.Template, req.System, req.Prompt, generated.String(), false)
+					g := generated.String()
+					slog.Debug("generate handler", "generated", g)
+					p, err := Prompt(req.Template, req.System, req.Prompt, g, false)
+
 					if err != nil {
 						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 						return
