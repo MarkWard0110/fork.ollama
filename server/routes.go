@@ -1430,7 +1430,9 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 		}
 
-		final.Message = api.Message{Role: "assistant", Content: sb.String()}
+		message := sb.String()
+		slog.Debug("chat handler", "response", message)
+		final.Message = api.Message{Role: "assistant", Content: message}
 		c.JSON(http.StatusOK, final)
 		return
 	}
