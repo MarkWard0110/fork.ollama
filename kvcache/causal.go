@@ -255,6 +255,14 @@ func (c *Causal) Close() {
 	}
 }
 
+func (c *Causal) Stats() Stats {
+	return Stats{
+		AllocatedCells: len(c.cells),
+		MaxCells:       c.maxCells,
+		MaxSequences:   c.maxSequences,
+	}
+}
+
 func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) error {
 	c.curBatchSize = len(batch.Positions)
 	c.curSequences = batch.Sequences

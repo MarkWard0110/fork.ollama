@@ -30,6 +30,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/ollama/ollama/kvcache"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/ml"
@@ -1412,25 +1413,44 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	used := int32(0)
+	cachedMax := int32(0)
+	activeMax := int32(0)
 	slotsInUse := 0
 	for i := range cache.slots {
 		slot := &cache.slots[i]
-		if !slot.inUseAtomic.Load() {
-			continue
-		}
-		slotsInUse++
 		l := slot.inputsLenAtomic.Load()
-		if l > used {
-			used = l
+		if l > cachedMax {
+			cachedMax = l
+		}
+		if slot.inUseAtomic.Load() {
+			slotsInUse++
+			if l > activeMax {
+				activeMax = l
+			}
 		}
 	}
 
 	resp := ml.RunnerStats{
-		ContextMax:  int(cache.numCtx),
-		ContextUsed: int(used),
-		Slots:       len(cache.slots),
-		SlotsInUse:  slotsInUse,
+		ContextMax:       int(cache.numCtx),
+		ContextUsed:      int(cachedMax),
+		ContextActive:    int(activeMax),
+		ContextAllocated: 0,
+		Slots:            len(cache.slots),
+		SlotsInUse:       slotsInUse,
+	}
+
+	// Best-effort: report allocation-based context capacity.
+	// This correlates more closely with retained VRAM than active usage.
+	if cache.cache != nil {
+		if sp, ok := cache.cache.(kvcache.StatsProvider); ok {
+			st := sp.Stats()
+			if st.MaxSequences > 0 && st.AllocatedCells > 0 {
+				// Convert allocated cells to a per-slot token capacity.
+				// We ceil-divide because allocations are padded/rounded.
+				perSlot := (st.AllocatedCells + st.MaxSequences - 1) / st.MaxSequences
+				resp.ContextAllocated = perSlot
+			}
+		}
 	}
 
 	if err := json.NewEncoder(w).Encode(&resp); err != nil {
