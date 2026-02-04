@@ -64,6 +64,72 @@ func TestStore(t *testing.T) {
 	})
 }
 
+func TestDynamicGrowth(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_DYNAMIC", "true")
+	t.Setenv("OLLAMA_KV_CACHE_INIT", "8")
+	t.Setenv("OLLAMA_KV_CACHE_GROW", "8")
+
+	runPermutedVariants(t, func(t *testing.T, backend *testBackend) {
+		cache := NewCausalCache(nil)
+		defer cache.Close()
+
+		// capacity is the max context per sequence; maxBatch is the maximum batch size.
+		cache.Init(backend, ml.DTypeF16, 1, 64, 4)
+
+		context := backend.NewContext()
+		defer context.Close()
+
+		// Store 40 tokens in 10 batches of 4, forcing cache growth from init=8.
+		for pass := 0; pass < 10; pass++ {
+			pos := []int32{int32(pass*4 + 0), int32(pass*4 + 1), int32(pass*4 + 2), int32(pass*4 + 3)}
+			seqs := []int{0, 0, 0, 0}
+
+			err := cache.StartForward(context, input.Batch{Positions: pos, Sequences: seqs}, false)
+			if err != nil {
+				t.Fatalf("StartForward failed (pass=%d): %v", pass, err)
+			}
+
+			cache.SetLayer(0)
+			vals := []float32{float32(pass*4 + 1), float32(pass*4 + 2), float32(pass*4 + 3), float32(pass*4 + 4)}
+			tensor := context.FromFloats(vals, 1, 1, 4)
+			cache.Put(context, tensor, tensor)
+		}
+
+		// Validate the final pass output: full history and correct causal mask for the last batch.
+		out, _, mask := cache.Get(context)
+		context.Forward(out, mask).Compute(out, mask)
+
+		expected := make([]float32, 40)
+		for i := range expected {
+			expected[i] = float32(i + 1)
+		}
+
+		if !slices.Equal(out.Shape(), []int{1, 1, 40}) {
+			t.Fatalf("out shape = %v, want %v", out.Shape(), []int{1, 1, 40})
+		}
+		if !slices.Equal(out.Floats(), expected) {
+			t.Fatalf("out = %v, want %v", out.Floats(), expected)
+		}
+
+		x := float32(math.Inf(-1))
+		expectedMask := make([]float32, 0, 40*4)
+		// Mask buffer is written batch-major in buildMask: i*length + j
+		batchPos := []int32{36, 37, 38, 39}
+		for _, p := range batchPos {
+			for h := int32(0); h < 40; h++ {
+				if h <= p {
+					expectedMask = append(expectedMask, 0)
+				} else {
+					expectedMask = append(expectedMask, x)
+				}
+			}
+		}
+		if !slices.Equal(mask.Floats(), expectedMask) {
+			t.Fatalf("mask mismatch")
+		}
+	})
+}
+
 func TestSWA(t *testing.T) {
 	runPermutedVariants(t, func(t *testing.T, backend *testBackend) {
 		cache := NewSWACache(1, nil)
