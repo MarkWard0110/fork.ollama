@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/ollama/ollama/kvcache"
@@ -87,10 +88,22 @@ type InputCacheSlot struct {
 	Inputs []*input.Input
 
 	// is this cache actively being processed as part of a sequence?
-	InUse bool
+	InUse       bool
+	inUseAtomic atomic.Bool
 
 	// last time this cache was used (as of start of processing)
 	lastUsed time.Time
+
+	inputsLenAtomic atomic.Int32
+}
+
+func (s *InputCacheSlot) setInUse(inUse bool) {
+	s.InUse = inUse
+	s.inUseAtomic.Store(inUse)
+}
+
+func (s *InputCacheSlot) syncInputsLen() {
+	s.inputsLenAtomic.Store(int32(len(s.Inputs)))
 }
 
 func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*InputCacheSlot, []*input.Input, error) {
@@ -116,6 +129,7 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 	}
 
 	slot.InUse = true
+	slot.inUseAtomic.Store(true)
 	slot.lastUsed = time.Now()
 
 	if numPast == int32(len(prompt)) {
@@ -152,6 +166,7 @@ func (c *InputCache) LoadCacheSlot(prompt []*input.Input, cachePrompt bool) (*In
 		"used", numPast, "remaining", int32(len(prompt))-numPast)
 
 	slot.Inputs = prompt[:numPast]
+	slot.syncInputsLen()
 	prompt = prompt[numPast:]
 
 	return slot, prompt, nil
@@ -218,6 +233,7 @@ func (c *InputCache) findBestCacheSlot(prompt []*input.Input) (*InputCacheSlot, 
 			len(longestSlot.Inputs))
 		oldestSlot.Inputs = make([]*input.Input, longest)
 		copy(oldestSlot.Inputs, longestSlot.Inputs[:longest])
+		oldestSlot.syncInputsLen()
 		if c.cache != nil {
 			c.cache.CopyPrefix(longestSlot.Id, oldestSlot.Id, longest)
 		}
@@ -309,6 +325,7 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 			// Reset the cache
 			_ = c.cache.Remove(slot.Id, 0, math.MaxInt32)
 			slot.Inputs = []*input.Input{}
+			slot.syncInputsLen()
 
 			// Return error with inputs that need to be reprocessed
 			return &ErrReprocessInputs{Inputs: newInputs}
@@ -319,6 +336,7 @@ func (c *InputCache) ShiftCacheSlot(slot *InputCacheSlot, numKeep int32) error {
 		slot.Inputs[i-discard] = slot.Inputs[i]
 	}
 	slot.Inputs = slot.Inputs[:inputLen-discard]
+	slot.syncInputsLen()
 
 	return nil
 }

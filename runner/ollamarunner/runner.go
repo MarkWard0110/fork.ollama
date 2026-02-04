@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -377,7 +378,8 @@ type Server struct {
 	seqsSem *semaphore.Weighted
 
 	// KV cache
-	cache *InputCache
+	cache    *InputCache
+	cachePtr atomic.Pointer[InputCache]
 
 	// next sequence for prompt processing to avoid starvation
 	nextSeq int
@@ -431,7 +433,7 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 	seq.doneReason = reason
 	close(seq.responses)
 	close(seq.embedding)
-	seq.cache.InUse = false
+	seq.cache.setInUse(false)
 	s.seqs[seqIndex] = nil
 	s.seqsSem.Release(1)
 }
@@ -518,6 +520,7 @@ func (s *Server) forwardBatch(pendingBatch batchState) (nextBatch batchState, er
 		if !s.cache.enabled {
 			seq.inputs = append(seq.cache.Inputs, seq.inputs...)
 			seq.cache.Inputs = []*input.Input{}
+			seq.cache.syncInputsLen()
 		}
 
 		batchSize := s.batchSize
@@ -693,6 +696,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 		if len(seq.pendingInputs) > 0 {
 			seq.cache.Inputs = append(seq.cache.Inputs, seq.pendingInputs...)
 			seq.pendingInputs = []*input.Input{}
+			seq.cache.syncInputsLen()
 		}
 
 		// don't sample prompt processing
@@ -828,6 +832,7 @@ func (s *Server) computeBatch(activeBatch batchState) {
 			}
 
 			seq.cache.Inputs = seq.cache.Inputs[:tokenLen]
+			seq.cache.syncInputsLen()
 
 			s.removeSequence(i, llm.DoneReasonStop)
 			continue
@@ -1224,6 +1229,7 @@ func (s *Server) allocModel(
 	if err != nil {
 		return err
 	}
+	s.cachePtr.Store(s.cache)
 
 	s.parallel = parallel
 	s.seqs = make([]*Sequence, s.parallel)
@@ -1241,6 +1247,7 @@ func (s *Server) allocModel(
 func (s *Server) closeModel() {
 	s.cache.Close()
 	s.cache = nil
+	s.cachePtr.Store(nil)
 	if s.model != nil {
 		s.model.Backend().Close()
 		s.model = nil
@@ -1394,6 +1401,44 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// stats is the handler called by the Ollama server to report information
+// about the runner's live context usage.
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	cache := s.cachePtr.Load()
+	if cache == nil {
+		http.Error(w, "cache not initialized", http.StatusNotFound)
+		return
+	}
+
+	used := int32(0)
+	slotsInUse := 0
+	for i := range cache.slots {
+		slot := &cache.slots[i]
+		if !slot.inUseAtomic.Load() {
+			continue
+		}
+		slotsInUse++
+		l := slot.inputsLenAtomic.Load()
+		if l > used {
+			used = l
+		}
+	}
+
+	resp := ml.RunnerStats{
+		ContextMax:  int(cache.numCtx),
+		ContextUsed: int(used),
+		Slots:       len(cache.slots),
+		SlotsInUse:  slotsInUse,
+	}
+
+	if err := json.NewEncoder(w).Encode(&resp); err != nil {
+		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+		return
+	}
+}
+
 func Execute(args []string) error {
 	fs := flag.NewFlagSet("runner", flag.ExitOnError)
 	mpath := fs.String("model", "", "Path to model binary file")
@@ -1434,6 +1479,7 @@ func Execute(args []string) error {
 	mux := http.NewServeMux()
 	// TODO: support embeddings
 	mux.HandleFunc("GET /info", server.info)
+	mux.HandleFunc("GET /stats", server.stats)
 	mux.HandleFunc("POST /load", server.load)
 	mux.HandleFunc("POST /embedding", server.embeddings)
 	mux.HandleFunc("POST /completion", server.completion)

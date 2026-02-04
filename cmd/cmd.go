@@ -930,6 +930,9 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				until = format.HumanTime(m.ExpiresAt, "Never")
 			}
 			ctxStr := strconv.Itoa(m.ContextLength)
+			if m.ContextUsed != nil {
+				ctxStr = fmt.Sprintf("%d/%d", *m.ContextUsed, m.ContextLength)
+			}
 			row := []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until}
 			if verbose {
 				if m.VRAMTotal > 0 {

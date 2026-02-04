@@ -829,6 +829,10 @@ type ProcessModelResponse struct {
 	SizeVRAM      int64        `json:"size_vram"`
 	ContextLength int          `json:"context_length"`
 
+	// Optional: live context usage as reported by the runner at request time.
+	// When present, this is the maximum token count among active cache slots.
+	ContextUsed *int `json:"context_used,omitempty"`
+
 	// Optional: live VRAM information reported by the runner at request time.
 	// These values are intended for observability (e.g. `ollama ps --verbose`).
 	VRAMUsed  int64 `json:"vram_used,omitempty"`

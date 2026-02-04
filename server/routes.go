@@ -1914,6 +1914,17 @@ func (s *Server) PsHandler(c *gin.Context) {
 		if v.llama != nil {
 			mr.ContextLength = v.llama.ContextLength()
 
+			// Best-effort live context usage reporting.
+			{
+				ctx, cancel := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
+				stats, err := ml.GetRunnerStatsFromRunner(ctx, v.llama)
+				cancel()
+				if err == nil && stats != nil {
+					used := stats.ContextUsed
+					mr.ContextUsed = &used
+				}
+			}
+
 			// Best-effort live VRAM reporting. Only supported by runners that expose
 			// the /info endpoint (native engine); llama.cpp runners may return nil.
 			if len(v.gpus) > 0 {
