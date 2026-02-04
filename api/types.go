@@ -830,8 +830,17 @@ type ProcessModelResponse struct {
 	ContextLength int          `json:"context_length"`
 
 	// Optional: live context usage as reported by the runner at request time.
-	// When present, this is the maximum token count among active cache slots.
+	// When present, this is a cached-context watermark: the maximum token count
+	// stored in any cache slot (active or inactive).
 	ContextUsed *int `json:"context_used,omitempty"`
+
+	// Optional: live active context usage as reported by the runner at request time.
+	// When present, this is the maximum token count among active (in-use) cache slots.
+	ContextActive *int `json:"context_active,omitempty"`
+
+	// Optional: allocation-based context capacity per slot as reported by the runner.
+	// When present, this correlates with KV memory allocation (and thus retained VRAM).
+	ContextAllocated *int `json:"context_allocated,omitempty"`
 
 	// Optional: live VRAM information reported by the runner at request time.
 	// These values are intended for observability (e.g. `ollama ps --verbose`).

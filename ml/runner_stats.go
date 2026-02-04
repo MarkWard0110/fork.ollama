@@ -16,10 +16,18 @@ import (
 // This is an internal API used by the Ollama server for observability.
 // Not all runners support these fields.
 type RunnerStats struct {
-	ContextMax  int `json:"context_max"`
+	ContextMax int `json:"context_max"`
+	// ContextUsed is a cached-context watermark. It is the maximum number of
+	// tokens currently stored in any cache slot (active or inactive).
 	ContextUsed int `json:"context_used"`
-	Slots       int `json:"slots"`
-	SlotsInUse  int `json:"slots_in_use"`
+	// ContextActive is the maximum number of tokens currently stored in any
+	// active (in-use) cache slot.
+	ContextActive int `json:"context_active"`
+	// ContextAllocated is the current allocation-based context capacity per slot.
+	// For the causal cache this is derived from allocated cache cells.
+	ContextAllocated int `json:"context_allocated"`
+	Slots            int `json:"slots"`
+	SlotsInUse       int `json:"slots_in_use"`
 }
 
 // GetRunnerStatsFromRunner queries a runner's /stats endpoint.

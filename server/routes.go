@@ -1922,6 +1922,12 @@ func (s *Server) PsHandler(c *gin.Context) {
 				if err == nil && stats != nil {
 					used := stats.ContextUsed
 					mr.ContextUsed = &used
+					active := stats.ContextActive
+					mr.ContextActive = &active
+					allocated := stats.ContextAllocated
+					if allocated > 0 {
+						mr.ContextAllocated = &allocated
+					}
 				}
 			}
 

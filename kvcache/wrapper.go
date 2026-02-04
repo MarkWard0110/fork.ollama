@@ -17,6 +17,27 @@ type WrapperCache struct {
 	curType int
 }
 
+func (c *WrapperCache) Stats() Stats {
+	var out Stats
+	for _, cache := range c.caches {
+		sp, ok := cache.(StatsProvider)
+		if !ok {
+			continue
+		}
+		st := sp.Stats()
+		if st.MaxSequences > out.MaxSequences {
+			out.MaxSequences = st.MaxSequences
+		}
+		if st.AllocatedCells > out.AllocatedCells {
+			out.AllocatedCells = st.AllocatedCells
+		}
+		if st.MaxCells > out.MaxCells {
+			out.MaxCells = st.MaxCells
+		}
+	}
+	return out
+}
+
 func NewWrapperCache(caches ...Cache) *WrapperCache {
 	return &WrapperCache{
 		caches: caches,

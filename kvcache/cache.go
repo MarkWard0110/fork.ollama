@@ -82,3 +82,19 @@ type Cache interface {
 type CheckpointCache interface {
 	PrepareRestore(seq int, targetPos int32) (int32, bool)
 }
+
+// StatsProvider is implemented by caches that can report internal sizing
+// information for observability.
+type StatsProvider interface {
+	Stats() Stats
+}
+
+// Stats is best-effort cache sizing information.
+type Stats struct {
+	// AllocatedCells is the number of cache cells currently allocated.
+	AllocatedCells int
+	// MaxCells is the maximum number of cache cells (the hard cap).
+	MaxCells int
+	// MaxSequences is the number of sequences the cache was initialized for.
+	MaxSequences int
+}

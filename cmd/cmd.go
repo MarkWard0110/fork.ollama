@@ -930,10 +930,18 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				until = format.HumanTime(m.ExpiresAt, "Never")
 			}
 			ctxStr := strconv.Itoa(m.ContextLength)
-			if m.ContextUsed != nil {
-				ctxStr = fmt.Sprintf("%d/%d", *m.ContextUsed, m.ContextLength)
+			if m.ContextAllocated != nil {
+				ctxStr = fmt.Sprintf("%d/%d", *m.ContextAllocated, m.ContextLength)
 			}
-			row := []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until}
+			row := []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr}
+			if verbose {
+				if m.ContextActive != nil {
+					row = append(row, strconv.Itoa(*m.ContextActive))
+				} else {
+					row = append(row, "")
+				}
+			}
+			row = append(row, until)
 			if verbose {
 				if m.VRAMTotal > 0 {
 					row = append(row, fmt.Sprintf("%s/%s", format.HumanBytes(m.VRAMUsed), format.HumanBytes(m.VRAMTotal)))
@@ -946,7 +954,11 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
-	header := []string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT", "UNTIL"}
+	header := []string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT"}
+	if verbose {
+		header = append(header, "ACTIVE")
+	}
+	header = append(header, "UNTIL")
 	if verbose {
 		header = append(header, "VRAM")
 	}
