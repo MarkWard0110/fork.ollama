@@ -190,7 +190,10 @@ func (c *Causal) Init(backend ml.Backend, dtype ml.DType, maxSequences, capacity
 
 	// Dynamic KV allocation is only supported for the unbounded causal cache right now.
 	// Sliding window + chunked attention have tighter invariants; keep existing eager allocation.
-	dynamic := envconfig.KvCacheDynamic(true)
+	//
+	// NOTE: This is intentionally opt-in to preserve the historical behavior unless
+	// explicitly enabled.
+	dynamic := envconfig.KvCacheDynamic(false)
 	if dynamic && (c.swaMemorySize != math.MaxInt32 || c.chunkSize != 0) {
 		dynamic = false
 	}
