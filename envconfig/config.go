@@ -283,7 +283,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_DEBUG":             {"OLLAMA_DEBUG", LogLevel(), "Show additional debug information (e.g. OLLAMA_DEBUG=1)"},
 		"OLLAMA_FLASH_ATTENTION":   {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":     {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
-		"OLLAMA_KV_CACHE_DYNAMIC":  {"OLLAMA_KV_CACHE_DYNAMIC", KvCacheDynamic(true), "Enable dynamic KV cache allocation (default: true)"},
+		"OLLAMA_KV_CACHE_DYNAMIC":  {"OLLAMA_KV_CACHE_DYNAMIC", KvCacheDynamic(false), "Enable dynamic KV cache allocation (default: false)"},
 		"OLLAMA_KV_CACHE_INIT":     {"OLLAMA_KV_CACHE_INIT", KvCacheInit(), "Initial KV cache context length to allocate per sequence (tokens) (default: 2048)"},
 		"OLLAMA_KV_CACHE_GROW":     {"OLLAMA_KV_CACHE_GROW", KvCacheGrow(), "KV cache growth block size per sequence (tokens) (default: 1024)"},
 		"OLLAMA_GPU_OVERHEAD":      {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
