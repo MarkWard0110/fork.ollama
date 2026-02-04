@@ -42,6 +42,7 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/middleware"
+	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/model/renderers"
 	"github.com/ollama/ollama/server/internal/client/ollama"
@@ -1912,6 +1913,38 @@ func (s *Server) PsHandler(c *gin.Context) {
 		}
 		if v.llama != nil {
 			mr.ContextLength = v.llama.ContextLength()
+
+			// Best-effort live VRAM reporting. Only supported by runners that expose
+			// the /info endpoint (native engine); llama.cpp runners may return nil.
+			if len(v.gpus) > 0 {
+				ctx, cancel := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
+				devices := v.llama.GetDeviceInfos(ctx)
+				cancel()
+
+				if len(devices) > 0 {
+					active := make(map[ml.DeviceID]struct{}, len(v.gpus))
+					for _, id := range v.gpus {
+						active[id] = struct{}{}
+					}
+
+					var total, free uint64
+					for _, d := range devices {
+						if _, ok := active[d.DeviceID]; ok {
+							total += d.TotalMemory
+							free += d.FreeMemory
+						}
+					}
+
+					if total > 0 {
+						if free > total {
+							free = total
+						}
+						mr.VRAMTotal = int64(total)
+						mr.VRAMFree = int64(free)
+						mr.VRAMUsed = int64(total - free)
+					}
+				}
+			}
 		}
 		// The scheduler waits to set expiresAt, so if a model is loading it's
 		// possible that it will be set to the unix epoch. For those cases, just

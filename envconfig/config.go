@@ -190,6 +190,12 @@ var (
 	FlashAttention = BoolWithDefault("OLLAMA_FLASH_ATTENTION")
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
+	// KvCacheDynamic enables dynamic, block-based KV cache allocation (new engine).
+	KvCacheDynamic = BoolWithDefault("OLLAMA_KV_CACHE_DYNAMIC")
+	// KvCacheInit is the initial context length (tokens per sequence) to allocate for the KV cache.
+	KvCacheInit = Uint("OLLAMA_KV_CACHE_INIT", 2048)
+	// KvCacheGrow is the growth block size (tokens per sequence) for dynamic KV cache allocation.
+	KvCacheGrow = Uint("OLLAMA_KV_CACHE_GROW", 1024)
 	// NoHistory disables readline history.
 	NoHistory = Bool("OLLAMA_NOHISTORY")
 	// NoPrune disables pruning of model blobs on startup.
@@ -277,6 +283,9 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_DEBUG":             {"OLLAMA_DEBUG", LogLevel(), "Show additional debug information (e.g. OLLAMA_DEBUG=1)"},
 		"OLLAMA_FLASH_ATTENTION":   {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":     {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
+		"OLLAMA_KV_CACHE_DYNAMIC":  {"OLLAMA_KV_CACHE_DYNAMIC", KvCacheDynamic(true), "Enable dynamic KV cache allocation (default: true)"},
+		"OLLAMA_KV_CACHE_INIT":     {"OLLAMA_KV_CACHE_INIT", KvCacheInit(), "Initial KV cache context length to allocate per sequence (tokens) (default: 2048)"},
+		"OLLAMA_KV_CACHE_GROW":     {"OLLAMA_KV_CACHE_GROW", KvCacheGrow(), "KV cache growth block size per sequence (tokens) (default: 1024)"},
 		"OLLAMA_GPU_OVERHEAD":      {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_HOST":              {"OLLAMA_HOST", Host(), "IP Address for the ollama server (default 127.0.0.1:11434)"},
 		"OLLAMA_KEEP_ALIVE":        {"OLLAMA_KEEP_ALIVE", KeepAlive(), "The duration that models stay loaded in memory (default \"5m\")"},

@@ -894,6 +894,11 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	verbose, err := cmd.Flags().GetBool("verbose")
+	if err != nil {
+		return err
+	}
+
 	models, err := client.ListRunning(cmd.Context())
 	if err != nil {
 		return err
@@ -925,12 +930,24 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				until = format.HumanTime(m.ExpiresAt, "Never")
 			}
 			ctxStr := strconv.Itoa(m.ContextLength)
-			data = append(data, []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until})
+			row := []string{m.Name, m.Digest[:12], format.HumanBytes(m.Size), procStr, ctxStr, until}
+			if verbose {
+				if m.VRAMTotal > 0 {
+					row = append(row, fmt.Sprintf("%s/%s", format.HumanBytes(m.VRAMUsed), format.HumanBytes(m.VRAMTotal)))
+				} else {
+					row = append(row, "")
+				}
+			}
+			data = append(data, row)
 		}
 	}
 
 	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT", "UNTIL"})
+	header := []string{"NAME", "ID", "SIZE", "PROCESSOR", "CONTEXT", "UNTIL"}
+	if verbose {
+		header = append(header, "VRAM")
+	}
+	table.SetHeader(header)
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
 	table.SetAlignment(tablewriter.ALIGN_LEFT)
 	table.SetHeaderLine(false)
@@ -2214,6 +2231,7 @@ func NewCLI() *cobra.Command {
 		PreRunE: checkServerHeartbeat,
 		RunE:    ListRunningHandler,
 	}
+	psCmd.Flags().BoolP("verbose", "v", false, "Show live VRAM usage (if supported)")
 	copyCmd := &cobra.Command{
 		Use:     "cp SOURCE DESTINATION",
 		Short:   "Copy a model",

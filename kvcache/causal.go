@@ -3,9 +3,11 @@ package kvcache
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"slices"
 
+	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/input"
 )
@@ -61,6 +63,13 @@ type Causal struct {
 	curPositions []int32
 
 	// ** cache metadata **
+
+	// dynamic allocation (tokens per sequence)
+	maxSequences int
+	maxCapacity  int
+	maxCells     int
+	growCells    int
+	dynamic      bool
 
 	// for each possible location in the cache, stores the position and set of sequences
 	// that reference the data there
@@ -166,14 +175,65 @@ func (c *Causal) Init(backend ml.Backend, dtype ml.DType, maxSequences, capacity
 		panic(fmt.Errorf("sliding window memory (%v) must be at least as large as the window (%v)", c.swaMemorySize, c.swaWindowSize))
 	}
 
-	var cacheSize int
+	c.maxSequences = maxSequences
+	c.maxCapacity = capacity
+
+	// Compute maximum cache size (existing behavior)
+	var maxCells int
 	if c.swaMemorySize == math.MaxInt32 {
-		cacheSize = maxSequences * capacity
+		maxCells = maxSequences * capacity
 	} else {
-		cacheSize = (maxSequences * int(c.swaMemorySize)) + maxBatch
+		maxCells = (maxSequences * int(c.swaMemorySize)) + maxBatch
 	}
-	cacheSize = roundUp(cacheSize, c.config.CachePadding)
-	c.cells = make([]cacheCell, cacheSize)
+	maxCells = roundUp(maxCells, c.config.CachePadding)
+	c.maxCells = maxCells
+
+	// Dynamic KV allocation is only supported for the unbounded causal cache right now.
+	// Sliding window + chunked attention have tighter invariants; keep existing eager allocation.
+	dynamic := envconfig.KvCacheDynamic(true)
+	if dynamic && (c.swaMemorySize != math.MaxInt32 || c.chunkSize != 0) {
+		dynamic = false
+	}
+
+	// Determine initial allocation and growth blocks.
+	initPerSeq := int(envconfig.KvCacheInit())
+	if initPerSeq <= 0 {
+		initPerSeq = capacity
+	}
+	initPerSeq = min(initPerSeq, capacity)
+	initPerSeq = max(initPerSeq, maxBatch)
+
+	growPerSeq := int(envconfig.KvCacheGrow())
+	if growPerSeq <= 0 {
+		growPerSeq = 1024
+	}
+	growPerSeq = min(growPerSeq, capacity)
+	if growPerSeq < 1 {
+		growPerSeq = 1
+	}
+
+	allocatedCells := maxCells
+	if dynamic {
+		allocatedCells = roundUp(maxSequences*initPerSeq, c.config.CachePadding)
+		allocatedCells = min(allocatedCells, maxCells)
+	}
+
+	c.dynamic = dynamic && allocatedCells < maxCells
+	c.growCells = roundUp(maxSequences*growPerSeq, c.config.CachePadding)
+	if c.growCells < c.config.CachePadding {
+		c.growCells = c.config.CachePadding
+	}
+
+	c.cells = make([]cacheCell, allocatedCells)
+	if c.dynamic {
+		slog.Debug("kv cache dynamic allocation enabled",
+			"max_cells", c.maxCells,
+			"initial_cells", len(c.cells),
+			"grow_cells", c.growCells,
+			"max_sequences", maxSequences,
+			"max_capacity", capacity,
+		)
+	}
 
 	c.DType = dtype
 	c.cellRanges = make(map[int]cellRange)
@@ -206,9 +266,27 @@ func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) e
 		c.updateSlidingWindow()
 
 		var err error
-		locs, err = c.findLocs()
-		if err != nil {
-			return err
+		for {
+			locs, err = c.findLocs()
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, ErrKvCacheFull) || !c.dynamic || len(c.cells) >= c.maxCells {
+				return err
+			}
+
+			newSize := min(c.maxCells, len(c.cells)+c.growCells)
+			if newSize == len(c.cells) {
+				return err
+			}
+			slog.Debug("growing kv cache",
+				"from_cells", len(c.cells),
+				"to_cells", newSize,
+				"max_cells", c.maxCells,
+			)
+			if growErr := c.grow(ctx, newSize); growErr != nil {
+				return growErr
+			}
 		}
 
 		for i, pos := range batch.Positions {
@@ -243,6 +321,112 @@ func (c *Causal) StartForward(ctx ml.Context, batch input.Batch, reserve bool) e
 
 	c.curLoc = ctx.Input().FromInts(locs, len(locs))
 	c.curMask = c.buildMask(ctx)
+
+	return nil
+}
+
+func (c *Causal) grow(ctx ml.Context, newSize int) (err error) {
+	if newSize <= len(c.cells) {
+		return nil
+	}
+	if newSize > c.maxCells {
+		newSize = c.maxCells
+	}
+
+	oldSize := len(c.cells)
+
+	// Build the grown metadata slice without mutating state until we're sure we can.
+	newCells := make([]cacheCell, newSize)
+	copy(newCells, c.cells)
+
+	// Perform tensor copies in a dedicated context and compute immediately so we can
+	// safely dispose of old backing contexts.
+	copyCtx := c.backend.NewContext()
+	defer copyCtx.Close()
+
+	newCtxs := make(map[int]ml.Context, len(c.ctxs))
+	newKeys := make(map[int]ml.Tensor, len(c.keys))
+	newValues := make(map[int]ml.Tensor, len(c.values))
+
+	// Convert backend allocation panics (e.g. ml.ErrNoMem) into regular errors and
+	// close any partially allocated resources.
+	defer func() {
+		if r := recover(); r != nil {
+			for _, nctx := range newCtxs {
+				nctx.Close()
+			}
+
+			if e, ok := r.(error); ok {
+				var noMem ml.ErrNoMem
+				if errors.As(e, &noMem) {
+					err = noMem
+					return
+				}
+				err = e
+				return
+			}
+
+			err = fmt.Errorf("kv cache grow panic: %v", r)
+		}
+	}()
+
+	for layer, oldKey := range c.keys {
+		oldValue := c.values[layer]
+
+		kHeadDim := oldKey.Dim(0)
+		numKVHeads := oldKey.Dim(1)
+		oldLen := oldKey.Dim(2)
+		if oldLen != oldSize {
+			panic(fmt.Errorf("kv cache grow: unexpected key length (layer=%d oldLen=%d oldCells=%d)", layer, oldLen, oldSize))
+		}
+
+		newLayerCtx := c.backend.NewContextSize(2).Layer(layer)
+		newKey := newLayerCtx.Zeros(c.DType, kHeadDim, numKVHeads, newSize)
+		keyPrefix := newKey.View(copyCtx, 0,
+			kHeadDim, newKey.Stride(1),
+			numKVHeads, newKey.Stride(2),
+			oldSize,
+		)
+		keyCopy := oldKey.Copy(copyCtx, keyPrefix)
+
+		var newValue ml.Tensor
+		if c.config.PermutedV {
+			vHeadDim := oldValue.Dim(1)
+			newValue = newLayerCtx.Zeros(c.DType, newSize, vHeadDim, numKVHeads)
+			valuePrefix := newValue.View(copyCtx, 0,
+				oldSize, newValue.Stride(1),
+				vHeadDim, newValue.Stride(2),
+				numKVHeads,
+			)
+			valueCopy := oldValue.Copy(copyCtx, valuePrefix)
+			copyCtx.Forward(keyCopy, valueCopy).Compute(keyCopy, valueCopy)
+		} else {
+			vHeadDim := oldValue.Dim(0)
+			newValue = newLayerCtx.Zeros(c.DType, vHeadDim, numKVHeads, newSize)
+			valuePrefix := newValue.View(copyCtx, 0,
+				vHeadDim, newValue.Stride(1),
+				numKVHeads, newValue.Stride(2),
+				oldSize,
+			)
+			valueCopy := oldValue.Copy(copyCtx, valuePrefix)
+			copyCtx.Forward(keyCopy, valueCopy).Compute(keyCopy, valueCopy)
+		}
+
+		newCtxs[layer] = newLayerCtx
+		newKeys[layer] = newKey
+		newValues[layer] = newValue
+	}
+
+	// Commit: swap metadata and tensors, then close old contexts.
+	c.cells = newCells
+	for layer, newLayerCtx := range newCtxs {
+		if oldLayerCtx, ok := c.ctxs[layer]; ok {
+			oldLayerCtx.Close()
+		}
+		c.ctxs[layer] = newLayerCtx
+		c.keys[layer] = newKeys[layer]
+		c.values[layer] = newValues[layer]
+	}
 
 	return nil
 }

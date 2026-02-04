@@ -42,6 +42,9 @@ var LibOllamaPath string = func() string {
 		libPath,
 
 		// build paths for development
+		// When running a locally built binary from ./bin, the repo build output
+		// is typically at ../build/lib/ollama relative to the executable.
+		filepath.Join(filepath.Dir(exe), "..", "build", "lib", "ollama"),
 		filepath.Join(filepath.Dir(exe), "build", "lib", "ollama"),
 		filepath.Join(cwd, "build", "lib", "ollama"),
 	}

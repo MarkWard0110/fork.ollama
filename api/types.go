@@ -828,6 +828,12 @@ type ProcessModelResponse struct {
 	ExpiresAt     time.Time    `json:"expires_at"`
 	SizeVRAM      int64        `json:"size_vram"`
 	ContextLength int          `json:"context_length"`
+
+	// Optional: live VRAM information reported by the runner at request time.
+	// These values are intended for observability (e.g. `ollama ps --verbose`).
+	VRAMUsed  int64 `json:"vram_used,omitempty"`
+	VRAMFree  int64 `json:"vram_free,omitempty"`
+	VRAMTotal int64 `json:"vram_total,omitempty"`
 }
 
 type TokenResponse struct {
