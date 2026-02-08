@@ -855,6 +855,9 @@ type ProcessModelResponse struct {
 	VRAMUsed  int64 `json:"vram_used,omitempty"`
 	VRAMFree  int64 `json:"vram_free,omitempty"`
 	VRAMTotal int64 `json:"vram_total,omitempty"`
+
+	// Optional: live System RAM used by this model (CPU-offloaded weights + KV cache).
+	RAMUsed int64 `json:"ram_used,omitempty"`
 }
 
 type TokenResponse struct {

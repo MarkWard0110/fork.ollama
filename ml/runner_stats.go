@@ -26,8 +26,11 @@ type RunnerStats struct {
 	// ContextAllocated is the current allocation-based context capacity per slot.
 	// For the causal cache this is derived from allocated cache cells.
 	ContextAllocated int `json:"context_allocated"`
-	Slots            int `json:"slots"`
-	SlotsInUse       int `json:"slots_in_use"`
+	// ContextInitial is the initial allocation-based context capacity per slot
+	// at cache creation time, before any dynamic growth.
+	ContextInitial int `json:"context_initial"`
+	Slots          int `json:"slots"`
+	SlotsInUse     int `json:"slots_in_use"`
 }
 
 // GetRunnerStatsFromRunner queries a runner's /stats endpoint.

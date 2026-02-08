@@ -389,6 +389,21 @@ func (s *Server) VRAMByGPU(id ml.DeviceID) uint64 {
 	return s.vramSize
 }
 
+// VRAMCacheSize returns the KV cache portion of VRAM (not applicable for image generation).
+func (s *Server) VRAMCacheSize() uint64 {
+	return 0
+}
+
+// CPUCacheSize returns the CPU cache portion (not applicable for image generation).
+func (s *Server) CPUCacheSize() uint64 {
+	return 0
+}
+
+// InputWeightsSize returns the input weights size (not tracked separately for image generation).
+func (s *Server) InputWeightsSize() uint64 {
+	return 0
+}
+
 // ContextLength returns the context length (not applicable for image generation).
 func (s *Server) ContextLength() int {
 	return 0

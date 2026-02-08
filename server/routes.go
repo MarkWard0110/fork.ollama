@@ -2089,10 +2089,13 @@ func (s *Server) PsHandler(c *gin.Context) {
 		if v.llama != nil {
 			mr.ContextLength = v.llama.ContextLength()
 
-			// Best-effort live context usage reporting.
+			// Best-effort live context and VRAM usage reporting.
+			// We query /stats once and use it for both context display and VRAM scaling.
+			var stats *ml.RunnerStats
 			{
 				ctx, cancel := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
-				stats, err := ml.GetRunnerStatsFromRunner(ctx, v.llama)
+				var err error
+				stats, err = ml.GetRunnerStatsFromRunner(ctx, v.llama)
 				cancel()
 				if err == nil && stats != nil {
 					used := stats.ContextUsed
@@ -2106,34 +2109,77 @@ func (s *Server) PsHandler(c *gin.Context) {
 				}
 			}
 
-			// Best-effort live VRAM reporting. Only supported by runners that expose
-			// the /info endpoint (native engine); llama.cpp runners may return nil.
-			if len(v.gpus) > 0 {
-				ctx, cancel := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
-				devices := v.llama.GetDeviceInfos(ctx)
-				cancel()
+			// Compute live VRAM and RAM used by this model.
+			//
+			// The load-time snapshot (VRAMSize, TotalSize) reflects the initial allocation
+			// which may be much smaller than current usage when dynamic KV cache is active.
+			// We decompose memory into a static portion (weights + graph) and a dynamic
+			// portion (KV cache), then scale the cache by the growth ratio
+			// (ContextAllocated / ContextInitial) from /stats.
+			{
+				vramUsed := v.vramSize
+				initialCacheVRAM := v.llama.VRAMCacheSize()
+				initialCacheCPU := v.llama.CPUCacheSize()
+				var ratio float64
 
-				if len(devices) > 0 {
-					active := make(map[ml.DeviceID]struct{}, len(v.gpus))
-					for _, id := range v.gpus {
-						active[id] = struct{}{}
-					}
+				if stats != nil && stats.ContextInitial > 0 && stats.ContextAllocated > 0 {
+					ratio = float64(stats.ContextAllocated) / float64(stats.ContextInitial)
+				}
 
-					var total, free uint64
-					for _, d := range devices {
-						if _, ok := active[d.DeviceID]; ok {
-							total += d.TotalMemory
-							free += d.FreeMemory
+				// Scale GPU cache
+				if ratio > 0 && initialCacheVRAM > 0 {
+					staticVRAM := vramUsed - initialCacheVRAM
+					currentCacheVRAM := uint64(float64(initialCacheVRAM) * ratio)
+					vramUsed = staticVRAM + currentCacheVRAM
+				}
+
+				// Scale CPU cache and compute RAM used
+				cpuSize := v.totalSize - v.vramSize // load-time CPU portion
+				if ratio > 0 && initialCacheCPU > 0 {
+					staticCPU := cpuSize - initialCacheCPU
+					currentCacheCPU := uint64(float64(initialCacheCPU) * ratio)
+					cpuSize = staticCPU + currentCacheCPU
+				}
+
+				// Update Size to reflect current total footprint (GPU + CPU)
+				mr.Size = int64(vramUsed + cpuSize)
+
+				// Report RAM if there's any CPU component
+				if cpuSize > 0 {
+					mr.RAMUsed = int64(cpuSize)
+				}
+
+				// Report VRAM with per-model GPU capacity
+				if len(v.gpus) > 0 {
+					var total uint64
+					ctx, cancel := context.WithTimeout(c.Request.Context(), 250*time.Millisecond)
+					devices := v.llama.GetDeviceInfos(ctx)
+					cancel()
+					if len(devices) > 0 {
+						active := make(map[ml.DeviceID]struct{}, len(v.gpus))
+						for _, id := range v.gpus {
+							active[id] = struct{}{}
+						}
+						for _, d := range devices {
+							if _, ok := active[d.DeviceID]; ok {
+								total += d.TotalMemory
+							}
 						}
 					}
 
-					if total > 0 {
-						if free > total {
-							free = total
+					if vramUsed > 0 {
+						mr.VRAMUsed = int64(vramUsed)
+						if total > 0 {
+							mr.VRAMTotal = int64(total)
+							if vramUsed < total {
+								mr.VRAMFree = int64(total - vramUsed)
+							} else {
+								mr.VRAMFree = 0
+							}
+						} else {
+							mr.VRAMTotal = int64(vramUsed)
+							mr.VRAMFree = 0
 						}
-						mr.VRAMTotal = int64(total)
-						mr.VRAMFree = int64(free)
-						mr.VRAMUsed = int64(total - free)
 					}
 				}
 			}

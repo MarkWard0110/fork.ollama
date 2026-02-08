@@ -74,9 +74,19 @@ type LlamaServer interface {
 	Tokenize(ctx context.Context, content string) ([]int, error)
 	Detokenize(ctx context.Context, tokens []int) (string, error)
 	Close() error
-	VRAMSize() uint64 // Total VRAM across all GPUs
+	VRAMSize() uint64 // Total VRAM across all GPUs (includes InputWeights for fully-offloaded models)
 	TotalSize() uint64
 	VRAMByGPU(id ml.DeviceID) uint64
+	// VRAMCacheSize returns the total KV cache VRAM across all GPUs from the
+	// load-time memory snapshot. This is used with ContextInitial from stats
+	// to compute the current live cache VRAM via linear scaling.
+	VRAMCacheSize() uint64
+	// CPUCacheSize returns the total KV cache on CPU (System RAM) from the
+	// load-time memory snapshot.
+	CPUCacheSize() uint64
+	// InputWeightsSize returns the size of input (embedding) weights that are
+	// loaded to GPU but tracked separately from per-GPU DeviceMemory.
+	InputWeightsSize() uint64
 	Pid() int
 	GetPort() int
 	GetDeviceInfos(ctx context.Context) []ml.DeviceInfo
@@ -1922,6 +1932,39 @@ func (s *llmServer) VRAMByGPU(id ml.DeviceID) uint64 {
 
 func (s *llmServer) ContextLength() int {
 	return s.options.NumCtx
+}
+
+func (s *llmServer) VRAMCacheSize() uint64 {
+	if s.mem == nil {
+		return 0
+	}
+
+	var cache uint64
+	for _, g := range s.mem.GPUs {
+		for _, c := range g.Cache {
+			cache += c
+		}
+	}
+	return cache
+}
+
+func (s *llmServer) CPUCacheSize() uint64 {
+	if s.mem == nil {
+		return 0
+	}
+
+	var cache uint64
+	for _, c := range s.mem.CPU.Cache {
+		cache += c
+	}
+	return cache
+}
+
+func (s *llmServer) InputWeightsSize() uint64 {
+	if s.mem == nil {
+		return 0
+	}
+	return s.mem.InputWeights
 }
 
 func (s *ollamaServer) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo {
