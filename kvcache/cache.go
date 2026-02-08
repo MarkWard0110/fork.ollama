@@ -93,6 +93,9 @@ type StatsProvider interface {
 type Stats struct {
 	// AllocatedCells is the number of cache cells currently allocated.
 	AllocatedCells int
+	// InitialCells is the number of cache cells that were allocated at init time.
+	// For dynamic KV caches this is the starting allocation before any grow operations.
+	InitialCells int
 	// MaxCells is the maximum number of cache cells (the hard cap).
 	MaxCells int
 	// MaxSequences is the number of sequences the cache was initialized for.

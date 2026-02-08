@@ -909,6 +909,11 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 				} else {
 					row = append(row, "")
 				}
+				if m.RAMUsed > 0 {
+					row = append(row, format.HumanBytes(m.RAMUsed))
+				} else {
+					row = append(row, "")
+				}
 			}
 			data = append(data, row)
 		}
@@ -922,6 +927,7 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 	header = append(header, "UNTIL")
 	if verbose {
 		header = append(header, "VRAM")
+		header = append(header, "RAM")
 	}
 	table.SetHeader(header)
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)

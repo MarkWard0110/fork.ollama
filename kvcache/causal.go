@@ -68,6 +68,7 @@ type Causal struct {
 	maxSequences int
 	maxCapacity  int
 	maxCells     int
+	initialCells int
 	growCells    int
 	dynamic      bool
 
@@ -227,6 +228,8 @@ func (c *Causal) Init(backend ml.Backend, dtype ml.DType, maxSequences, capacity
 		c.growCells = c.config.CachePadding
 	}
 
+	c.initialCells = allocatedCells
+	c.initialCells = allocatedCells
 	c.cells = make([]cacheCell, allocatedCells)
 	if c.dynamic {
 		slog.Debug("kv cache dynamic allocation enabled",
@@ -261,6 +264,7 @@ func (c *Causal) Close() {
 func (c *Causal) Stats() Stats {
 	return Stats{
 		AllocatedCells: len(c.cells),
+		InitialCells:   c.initialCells,
 		MaxCells:       c.maxCells,
 		MaxSequences:   c.maxSequences,
 	}
@@ -410,7 +414,7 @@ func (c *Causal) grow(ctx ml.Context, newSize int) (err error) {
 				numKVHeads,
 			)
 			valueCopy := oldValue.Copy(copyCtx, valuePrefix)
-			copyCtx.Forward(keyCopy, valueCopy).Compute(keyCopy, valueCopy)
+			copyCtx.Forward(keyCopy, valueCopy)
 		} else {
 			vHeadDim := oldValue.Dim(0)
 			newValue = newLayerCtx.Zeros(c.DType, vHeadDim, numKVHeads, newSize)
@@ -420,13 +424,19 @@ func (c *Causal) grow(ctx ml.Context, newSize int) (err error) {
 				oldSize,
 			)
 			valueCopy := oldValue.Copy(copyCtx, valuePrefix)
-			copyCtx.Forward(keyCopy, valueCopy).Compute(keyCopy, valueCopy)
+			copyCtx.Forward(keyCopy, valueCopy)
 		}
 
 		newCtxs[layer] = newLayerCtx
 		newKeys[layer] = newKey
 		newValues[layer] = newValue
 	}
+
+	// Execute all layer copies in a single Compute call. Running per-layer
+	// would produce N consecutive graph changes on the shared CUDA backend,
+	// tripping the "too many consecutive updates" heuristic in ggml-cuda and
+	// permanently disabling CUDA graph replay for all subsequent inference.
+	copyCtx.Compute()
 
 	// Commit: swap metadata and tensors, then close old contexts.
 	c.cells = newCells

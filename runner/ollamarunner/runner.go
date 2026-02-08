@@ -1484,6 +1484,9 @@ func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
 				perSlot := (st.AllocatedCells + st.MaxSequences - 1) / st.MaxSequences
 				resp.ContextAllocated = perSlot
 			}
+			if st.MaxSequences > 0 && st.InitialCells > 0 {
+				resp.ContextInitial = (st.InitialCells + st.MaxSequences - 1) / st.MaxSequences
+			}
 		}
 	}
 
