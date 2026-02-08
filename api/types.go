@@ -605,6 +605,14 @@ type Runner struct {
 	MainGPU   int   `json:"main_gpu,omitempty"`
 	UseMMap   *bool `json:"use_mmap,omitempty"`
 	NumThread int   `json:"num_thread,omitempty"`
+
+	// SchedSpread forces layer placement to consider all GPUs.
+	// It is not part of the public HTTP API surface.
+	SchedSpread bool `json:"-"`
+
+	// RunnerEnv provides per-runner environment variable overrides.
+	// It is not part of the public HTTP API surface.
+	RunnerEnv map[string]string `json:"-"`
 }
 
 // EmbedRequest is the request passed to [Client.Embed].

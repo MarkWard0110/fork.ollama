@@ -716,6 +716,36 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 		optsNew.NumGPU = -1
 	}
 
+	// RunnerEnv and SchedSpread are internal-only load-time hints.
+	//
+	// The best-effort resume path may set them to force a reload into a more
+	// viable layout (e.g. multi-GPU spread + larger initial KV allocation). Once
+	// a runner has been loaded with these hints, it is always compatible with
+	// subsequent baseline requests that do not specify them.
+	//
+	// However, if a request explicitly requires these hints and the existing
+	// runner does not satisfy them, we must reload.
+	if optsNew.SchedSpread && !optsExisting.SchedSpread {
+		return true
+	}
+	if len(optsNew.RunnerEnv) > 0 {
+		if optsExisting.RunnerEnv == nil {
+			return true
+		}
+		for k, v := range optsNew.RunnerEnv {
+			if optsExisting.RunnerEnv[k] != v {
+				return true
+			}
+		}
+	}
+
+	// Normalize internal-only hints for DeepEqual.
+	if optsExisting.SchedSpread && !optsNew.SchedSpread {
+		optsNew.SchedSpread = true
+	}
+	optsExisting.RunnerEnv = nil
+	optsNew.RunnerEnv = nil
+
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if !reflect.DeepEqual(runner.model.AdapterPaths, req.model.AdapterPaths) || // have the adapters changed?

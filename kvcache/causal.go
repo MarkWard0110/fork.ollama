@@ -370,14 +370,14 @@ func (c *Causal) grow(ctx ml.Context, newSize int) (err error) {
 			if e, ok := r.(error); ok {
 				var noMem ml.ErrNoMem
 				if errors.As(e, &noMem) {
-					err = noMem
+					err = ErrKvCacheGrow{FromCells: oldSize, ToCells: newSize, MaxCells: c.maxCells, Err: noMem}
 					return
 				}
-				err = e
+				err = ErrKvCacheGrow{FromCells: oldSize, ToCells: newSize, MaxCells: c.maxCells, Err: e}
 				return
 			}
 
-			err = fmt.Errorf("kv cache grow panic: %v", r)
+			err = ErrKvCacheGrow{FromCells: oldSize, ToCells: newSize, MaxCells: c.maxCells, Err: fmt.Errorf("kv cache grow panic: %v", r)}
 		}
 	}()
 

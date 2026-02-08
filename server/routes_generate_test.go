@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +25,650 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/types/model"
 )
+
+func TestGenerateBestEffortResumeBumpsNumCtxNoDup(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	var (
+		mu       sync.Mutex
+		loadOpts []api.Runner
+	)
+
+	var completionCalls atomic.Int32
+	var promptsMu sync.Mutex
+	var prompts []string
+	var seenReqMu sync.Mutex
+	var seenReqs []llm.CompletionRequest
+
+	streamFalse := false
+
+	mock := mockRunner{}
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
+		seenReqMu.Lock()
+		seenReqs = append(seenReqs, r)
+		seenReqMu.Unlock()
+
+		promptsMu.Lock()
+		prompts = append(prompts, r.Prompt)
+		promptsMu.Unlock()
+
+		switch completionCalls.Add(1) {
+		case 1:
+			fn(llm.CompletionResponse{Content: "Hello ", Done: false})
+			return errors.New("insufficient memory while expanding KV cache (cells 4096 -> 8199, max 8200)")
+		case 2:
+			fn(llm.CompletionResponse{Content: "world", Done: true, DoneReason: llm.DoneReasonStop})
+			return nil
+		default:
+			return errors.New("unexpected extra Completion call")
+		}
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 8),
+			finishedReqCh:   make(chan *LlmRequest, 8),
+			expiredCh:       make(chan *runnerRef, 8),
+			unloadedCh:      make(chan any, 8),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				mu.Lock()
+				loadOpts = append(loadOpts, req.opts.Runner)
+				mu.Unlock()
+
+				req.successCh <- &runnerRef{llama: &mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "test",
+		Files:  map[string]string{"file.gguf": digest},
+		Stream: &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	w = createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:  "test",
+		Prompt: "Base:",
+		Raw:    true,
+		Options: map[string]any{
+			"num_ctx": 1024,
+			"num_gpu": 7,
+		},
+		Stream: &streamFalse,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.GenerateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Response != "Hello world" {
+		t.Fatalf("expected response %q, got %q", "Hello world", resp.Response)
+	}
+	if !resp.Done {
+		t.Fatalf("expected done true")
+	}
+
+	if got := completionCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 Completion calls, got %d", got)
+	}
+
+	promptsMu.Lock()
+	defer promptsMu.Unlock()
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 prompts, got %d", len(prompts))
+	}
+	if prompts[0] != "Base:" {
+		t.Fatalf("expected initial prompt %q, got %q", "Base:", prompts[0])
+	}
+	if prompts[1] != "Base:Hello " {
+		t.Fatalf("expected resume prompt %q, got %q", "Base:Hello ", prompts[1])
+	}
+
+	seenReqMu.Lock()
+	defer seenReqMu.Unlock()
+	if len(seenReqs) != 2 {
+		t.Fatalf("expected 2 completion requests, got %d", len(seenReqs))
+	}
+	if seenReqs[1].Options == nil {
+		t.Fatalf("expected retry request to include options")
+	}
+	if seenReqs[1].Options.NumCtx != 1025 {
+		t.Fatalf("expected retry num_ctx %d, got %d", 1025, seenReqs[1].Options.NumCtx)
+	}
+	if seenReqs[1].Options.NumGPU != 7 {
+		t.Fatalf("expected retry num_gpu to remain %d, got %d", 7, seenReqs[1].Options.NumGPU)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(loadOpts) != 2 {
+		t.Fatalf("expected 2 scheduler loads, got %d", len(loadOpts))
+	}
+	if loadOpts[0].NumCtx != 1024 || loadOpts[0].NumGPU != 7 {
+		t.Fatalf("expected initial scheduler load opts num_ctx=1024 num_gpu=7, got num_ctx=%d num_gpu=%d", loadOpts[0].NumCtx, loadOpts[0].NumGPU)
+	}
+	if loadOpts[0].RunnerEnv != nil {
+		t.Fatalf("expected initial scheduler load RunnerEnv to be nil, got %v", loadOpts[0].RunnerEnv)
+	}
+	if loadOpts[1].NumCtx != 1025 || loadOpts[1].NumGPU != 7 {
+		t.Fatalf("expected retry scheduler load opts num_ctx=1025 num_gpu=7, got num_ctx=%d num_gpu=%d", loadOpts[1].NumCtx, loadOpts[1].NumGPU)
+	}
+	if got := loadOpts[1].RunnerEnv["OLLAMA_KV_CACHE_INIT"]; got != "1025" {
+		t.Fatalf("expected retry scheduler load RunnerEnv OLLAMA_KV_CACHE_INIT=1025, got %q", got)
+	}
+}
+
+func TestGenerateBestEffortResumeWithThinkingEnabled(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	var completionCalls atomic.Int32
+	var promptsMu sync.Mutex
+	var prompts []string
+
+	streamFalse := false
+
+	mock := mockRunner{}
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
+		promptsMu.Lock()
+		prompts = append(prompts, r.Prompt)
+		promptsMu.Unlock()
+
+		switch completionCalls.Add(1) {
+		case 1:
+			fn(llm.CompletionResponse{Content: "<think>plan</think>Hello ", Done: false})
+			return errors.New("insufficient memory while expanding KV cache (cells 4096 -> 8199, max 8200)")
+		case 2:
+			fn(llm.CompletionResponse{Content: "world", Done: true, DoneReason: llm.DoneReasonStop})
+			return nil
+		default:
+			return errors.New("unexpected extra Completion call")
+		}
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 8),
+			finishedReqCh:   make(chan *LlmRequest, 8),
+			expiredCh:       make(chan *runnerRef, 8),
+			unloadedCh:      make(chan any, 8),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				req.successCh <- &runnerRef{llama: &mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model: "test-thinking",
+		Files: map[string]string{"file.gguf": digest},
+		Info: map[string]any{
+			"capabilities": []string{"completion", "thinking"},
+		},
+		// Provide a template that lets thinking.InferTags find <think>...</think>
+		// by referencing .Thinking inside a range over .Messages.
+		Template: "{{ range .Messages }}{{ if .Thinking }}<think>{{ .Thinking }}</think>{{ end }}{{ .Content }}{{ end }}",
+		Stream:   &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	w = createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:  "test-thinking",
+		Prompt: "Base:",
+		Raw:    true,
+		Options: map[string]any{
+			"num_ctx": 1024,
+		},
+		Stream: &streamFalse,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.GenerateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Response != "Hello world" {
+		t.Fatalf("expected response %q, got %q", "Hello world", resp.Response)
+	}
+	if resp.Thinking != "plan" {
+		t.Fatalf("expected thinking %q, got %q", "plan", resp.Thinking)
+	}
+
+	if got := completionCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 Completion calls, got %d", got)
+	}
+
+	promptsMu.Lock()
+	defer promptsMu.Unlock()
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 prompts, got %d", len(prompts))
+	}
+	if prompts[0] != "Base:" {
+		t.Fatalf("expected initial prompt %q, got %q", "Base:", prompts[0])
+	}
+	if prompts[1] != "Base:<think>plan</think>Hello " {
+		t.Fatalf("expected resume prompt %q, got %q", "Base:<think>plan</think>Hello ", prompts[1])
+	}
+}
+
+func TestGenerateBestEffortResumeKeepsMaxNumCtxWhenTargetLower(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	var (
+		mu       sync.Mutex
+		loadOpts []api.Runner
+	)
+
+	var completionCalls atomic.Int32
+	var promptsMu sync.Mutex
+	var prompts []string
+	var seenReqMu sync.Mutex
+	var seenReqs []llm.CompletionRequest
+
+	streamFalse := false
+
+	mock := mockRunner{}
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
+		seenReqMu.Lock()
+		seenReqs = append(seenReqs, r)
+		seenReqMu.Unlock()
+
+		promptsMu.Lock()
+		prompts = append(prompts, r.Prompt)
+		promptsMu.Unlock()
+
+		switch completionCalls.Add(1) {
+		case 1:
+			fn(llm.CompletionResponse{Content: "Hello ", Done: false})
+			// Target (5120) is below the configured max num_ctx (8192).
+			return errors.New("insufficient memory while expanding KV cache (cells 4096 -> 5120, max 8192)")
+		case 2:
+			fn(llm.CompletionResponse{Content: "world", Done: true, DoneReason: llm.DoneReasonStop})
+			return nil
+		default:
+			return errors.New("unexpected extra Completion call")
+		}
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 8),
+			finishedReqCh:   make(chan *LlmRequest, 8),
+			expiredCh:       make(chan *runnerRef, 8),
+			unloadedCh:      make(chan any, 8),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				mu.Lock()
+				loadOpts = append(loadOpts, req.opts.Runner)
+				mu.Unlock()
+
+				req.successCh <- &runnerRef{llama: &mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "test-keep-max",
+		Files:  map[string]string{"file.gguf": digest},
+		Stream: &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	w = createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:  "test-keep-max",
+		Prompt: "Base:",
+		Raw:    true,
+		Options: map[string]any{
+			"num_ctx": 8192,
+		},
+		Stream: &streamFalse,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.GenerateResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Response != "Hello world" {
+		t.Fatalf("expected response %q, got %q", "Hello world", resp.Response)
+	}
+	if !resp.Done {
+		t.Fatalf("expected done true")
+	}
+
+	if got := completionCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 Completion calls, got %d", got)
+	}
+
+	promptsMu.Lock()
+	defer promptsMu.Unlock()
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 prompts, got %d", len(prompts))
+	}
+	if prompts[0] != "Base:" {
+		t.Fatalf("expected initial prompt %q, got %q", "Base:", prompts[0])
+	}
+	if prompts[1] != "Base:Hello " {
+		t.Fatalf("expected resume prompt %q, got %q", "Base:Hello ", prompts[1])
+	}
+
+	seenReqMu.Lock()
+	defer seenReqMu.Unlock()
+	if len(seenReqs) != 2 {
+		t.Fatalf("expected 2 completion requests, got %d", len(seenReqs))
+	}
+	if seenReqs[1].Options == nil {
+		t.Fatalf("expected retry request to include options")
+	}
+	if seenReqs[1].Options.NumCtx != 8192 {
+		t.Fatalf("expected retry num_ctx to keep max %d, got %d", 8192, seenReqs[1].Options.NumCtx)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(loadOpts) != 2 {
+		t.Fatalf("expected 2 scheduler loads, got %d", len(loadOpts))
+	}
+	if loadOpts[0].NumCtx != 8192 {
+		t.Fatalf("expected initial scheduler load num_ctx=%d, got %d", 8192, loadOpts[0].NumCtx)
+	}
+	if loadOpts[1].NumCtx != 8192 {
+		t.Fatalf("expected retry scheduler load to keep max num_ctx=%d, got %d", 8192, loadOpts[1].NumCtx)
+	}
+	if got := loadOpts[1].RunnerEnv["OLLAMA_KV_CACHE_INIT"]; got != "5120" {
+		t.Fatalf("expected retry scheduler load RunnerEnv OLLAMA_KV_CACHE_INIT=5120, got %q", got)
+	}
+}
+
+func TestChatBestEffortResumeBumpsNumCtxNoDupWithThinking(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	var (
+		mu       sync.Mutex
+		loadOpts []api.Runner
+	)
+
+	var completionCalls atomic.Int32
+	var promptsMu sync.Mutex
+	var prompts []string
+	var seenReqMu sync.Mutex
+	var seenReqs []llm.CompletionRequest
+
+	streamFalse := false
+
+	mock := mockRunner{}
+	mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
+		seenReqMu.Lock()
+		seenReqs = append(seenReqs, r)
+		seenReqMu.Unlock()
+
+		promptsMu.Lock()
+		prompts = append(prompts, r.Prompt)
+		promptsMu.Unlock()
+
+		switch completionCalls.Add(1) {
+		case 1:
+			fn(llm.CompletionResponse{Content: "<think>plan</think>Hello ", Done: false})
+			return errors.New("insufficient memory while expanding KV cache (cells 4096 -> 8199, max 8200)")
+		case 2:
+			fn(llm.CompletionResponse{Content: "world", Done: true, DoneReason: llm.DoneReasonStop})
+			return nil
+		default:
+			return errors.New("unexpected extra Completion call")
+		}
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 8),
+			finishedReqCh:   make(chan *LlmRequest, 8),
+			expiredCh:       make(chan *runnerRef, 8),
+			unloadedCh:      make(chan any, 8),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ *ggml.GGML, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				mu.Lock()
+				loadOpts = append(loadOpts, req.opts.Runner)
+				mu.Unlock()
+
+				req.successCh <- &runnerRef{llama: &mock}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model: "test-chat-thinking",
+		Files: map[string]string{"file.gguf": digest},
+		Info: map[string]any{
+			"capabilities": []string{"completion", "thinking"},
+		},
+		Template: "{{ range .Messages }}{{ if .Thinking }}<think>{{ .Thinking }}</think>{{ end }}{{ .Content }}{{ end }}",
+		Stream:   &stream,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	w = createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "test-chat-thinking",
+		Messages: []api.Message{{
+			Role:    "user",
+			Content: "Base:",
+		}},
+		Options: map[string]any{
+			"num_ctx": 1024,
+			"num_gpu": 7,
+		},
+		Stream: &streamFalse,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.ChatResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Message.Content != "Hello world" {
+		t.Fatalf("expected content %q, got %q", "Hello world", resp.Message.Content)
+	}
+	if resp.Message.Thinking != "plan" {
+		t.Fatalf("expected thinking %q, got %q", "plan", resp.Message.Thinking)
+	}
+	if !resp.Done {
+		t.Fatalf("expected done true")
+	}
+
+	if got := completionCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 Completion calls, got %d", got)
+	}
+
+	promptsMu.Lock()
+	defer promptsMu.Unlock()
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 prompts, got %d", len(prompts))
+	}
+	if prompts[0] != "Base:" {
+		t.Fatalf("expected initial prompt %q, got %q", "Base:", prompts[0])
+	}
+	if prompts[1] != "Base:<think>plan</think>Hello " {
+		t.Fatalf("expected resume prompt %q, got %q", "Base:<think>plan</think>Hello ", prompts[1])
+	}
+
+	seenReqMu.Lock()
+	defer seenReqMu.Unlock()
+	if len(seenReqs) != 2 {
+		t.Fatalf("expected 2 completion requests, got %d", len(seenReqs))
+	}
+	if seenReqs[1].Options == nil {
+		t.Fatalf("expected retry request to include options")
+	}
+	if seenReqs[1].Options.NumCtx != 1025 {
+		t.Fatalf("expected retry num_ctx %d, got %d", 1025, seenReqs[1].Options.NumCtx)
+	}
+	if seenReqs[1].Options.NumGPU != 7 {
+		t.Fatalf("expected retry num_gpu to remain %d, got %d", 7, seenReqs[1].Options.NumGPU)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(loadOpts) != 2 {
+		t.Fatalf("expected 2 scheduler loads, got %d", len(loadOpts))
+	}
+	if loadOpts[0].NumCtx != 1024 || loadOpts[0].NumGPU != 7 {
+		t.Fatalf("expected initial scheduler load opts num_ctx=1024 num_gpu=7, got num_ctx=%d num_gpu=%d", loadOpts[0].NumCtx, loadOpts[0].NumGPU)
+	}
+	if loadOpts[0].RunnerEnv != nil {
+		t.Fatalf("expected initial scheduler load RunnerEnv to be nil, got %v", loadOpts[0].RunnerEnv)
+	}
+	if loadOpts[1].NumCtx != 1025 || loadOpts[1].NumGPU != 7 {
+		t.Fatalf("expected retry scheduler load opts num_ctx=1025 num_gpu=7, got num_ctx=%d num_gpu=%d", loadOpts[1].NumCtx, loadOpts[1].NumGPU)
+	}
+	if got := loadOpts[1].RunnerEnv["OLLAMA_KV_CACHE_INIT"]; got != "1025" {
+		t.Fatalf("expected retry scheduler load RunnerEnv OLLAMA_KV_CACHE_INIT=1025, got %q", got)
+	}
+}
 
 // testPropsMap creates a ToolPropertiesMap from a map (convenience function for tests)
 func testPropsMap(m map[string]api.ToolProperty) *api.ToolPropertiesMap {

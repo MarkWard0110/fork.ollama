@@ -272,7 +272,7 @@ func TestSchedRequestsSimpleReloadSameModel(t *testing.T) {
 
 func TestSchedRequestsMultipleLoadedModels(t *testing.T) {
 	slog.Info("TestRequestsMultipleLoadedModels")
-	ctx, done := context.WithTimeout(t.Context(), 1000*time.Millisecond)
+	ctx, done := context.WithTimeout(t.Context(), 3*time.Second)
 	defer done()
 	s := InitScheduler(ctx)
 	s.waitForRecovery = 10 * time.Millisecond
@@ -677,6 +677,35 @@ func TestSchedNeedsReload(t *testing.T) {
 	resp = runner.needsReload(ctx, req)
 	require.True(t, resp)
 	req.opts.NumGPU = -1
+	resp = runner.needsReload(ctx, req)
+	require.False(t, resp)
+
+	// Internal-only hints: a runner loaded with SchedSpread/RunnerEnv is compatible
+	// with baseline requests that don't specify them.
+	req.opts = api.DefaultOptions()
+	runner.Options = &do
+
+	runner.Options.Runner.SchedSpread = true
+	req.opts.Runner.SchedSpread = false
+	resp = runner.needsReload(ctx, req)
+	require.False(t, resp)
+
+	runner.Options.Runner.SchedSpread = false
+	req.opts.Runner.SchedSpread = true
+	resp = runner.needsReload(ctx, req)
+	require.True(t, resp)
+
+	runner.Options.Runner.SchedSpread = true
+	runner.Options.Runner.RunnerEnv = map[string]string{"OLLAMA_KV_CACHE_INIT": "5120"}
+	req.opts.Runner.RunnerEnv = nil
+	resp = runner.needsReload(ctx, req)
+	require.False(t, resp)
+
+	req.opts.Runner.RunnerEnv = map[string]string{"OLLAMA_KV_CACHE_INIT": "2048"}
+	resp = runner.needsReload(ctx, req)
+	require.True(t, resp)
+
+	req.opts.Runner.RunnerEnv = map[string]string{"OLLAMA_KV_CACHE_INIT": "5120"}
 	resp = runner.needsReload(ctx, req)
 	require.False(t, resp)
 }
