@@ -104,6 +104,7 @@ type Sequence struct {
 	shift bool
 
 	doneReason llm.DoneReason
+	errMsg     string
 
 	// logprobs configuration
 	logprobs    bool
@@ -439,6 +440,33 @@ func (s *Server) removeSequence(seqIndex int, reason llm.DoneReason) {
 	s.seqsSem.Release(1)
 }
 
+func (s *Server) failBatch(batch batchState, err error) {
+	// Best-effort: fail sequences that were part of the batch snapshot and are
+	// still present.
+	msg := err.Error()
+	var growErr kvcache.ErrKvCacheGrow
+	if errors.As(err, &growErr) {
+		msg = fmt.Sprintf("insufficient memory while expanding KV cache (cells %d -> %d, max %d)", growErr.FromCells, growErr.ToCells, growErr.MaxCells)
+	} else {
+		var noMem ml.ErrNoMem
+		if errors.As(err, &noMem) {
+			// Prefer a stable, user-friendly message when we know it's a memory issue.
+			msg = "insufficient memory while running the model (KV cache growth)"
+		}
+	}
+
+	for i, seq := range batch.seqs {
+		if seq == nil {
+			continue
+		}
+		if i >= len(s.seqs) || s.seqs[i] != seq {
+			continue
+		}
+		seq.errMsg = msg
+		s.removeSequence(i, llm.DoneReasonError)
+	}
+}
+
 // track batch state between forwardBatch, computeBatch and predictForwardBatch
 
 func (s *Server) run(ctx context.Context) {
@@ -455,7 +483,12 @@ func (s *Server) run(ctx context.Context) {
 			var err error
 			nextBatch, err := s.forwardBatch(previousBatch)
 			if err != nil {
-				panic(err)
+				// Do not crash the runner on recoverable errors like KV cache growth OOM.
+				s.mu.Lock()
+				s.failBatch(nextBatch, err)
+				s.mu.Unlock()
+				// Keep the previous batch so ordering with any in-flight compute remains correct.
+				continue
 			}
 
 			if supportsAsync {
@@ -979,6 +1012,7 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
 					Done:               true,
 					DoneReason:         seq.doneReason,
+					Error:              seq.errMsg,
 					PromptEvalCount:    seq.numPromptInputs,
 					PromptEvalDuration: seq.processingDuration,
 					EvalCount:          seq.numPredicted,

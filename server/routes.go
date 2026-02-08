@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -381,11 +382,16 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	// Acquire the runner with a cancellable context so we can release it early
+	// (and potentially reacquire a different layout) without canceling the request.
+	runnerCtx, runnerCancel := context.WithCancel(c.Request.Context())
+	r, m, opts, err := s.scheduleRunner(runnerCtx, name.String(), caps, req.Options, req.KeepAlive)
 	if errors.Is(err, errCapabilityCompletion) {
+		runnerCancel()
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support generate", req.Model)})
 		return
 	} else if err != nil {
+		runnerCancel()
 		handleScheduleError(c, req.Model, err)
 		return
 	}
@@ -523,9 +529,13 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
 		var sb strings.Builder
+		// best-effort resume prefix: content already emitted to the client.
+		var prefix strings.Builder
+		attemptedResume := false
 		defer close(ch)
-		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:      prompt,
+		basePrompt := prompt
+		completionReq := llm.CompletionRequest{
+			Prompt:      basePrompt,
 			Images:      images,
 			Format:      req.Format,
 			Options:     opts,
@@ -533,75 +543,176 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			Truncate:    req.Truncate == nil || *req.Truncate,
 			Logprobs:    req.Logprobs,
 			TopLogprobs: req.TopLogprobs,
-		}, func(cr llm.CompletionResponse) {
-			res := api.GenerateResponse{
-				Model:     req.Model,
-				CreatedAt: time.Now().UTC(),
-				Response:  cr.Content,
-				Done:      cr.Done,
-				Metrics: api.Metrics{
-					PromptEvalCount:    cr.PromptEvalCount,
-					PromptEvalDuration: cr.PromptEvalDuration,
-					EvalCount:          cr.EvalCount,
-					EvalDuration:       cr.EvalDuration,
-				},
-				Logprobs: toAPILogprobs(cr.Logprobs),
-			}
+		}
 
-			if builtinParser != nil {
-				content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
-				if err != nil {
-					ch <- gin.H{"error": err.Error()}
-					return
+		// Best-effort resume is only enabled when we're emitting raw model tokens
+		// (no built-in parsers transforming output). Thinking tag parsing is OK as
+		// long as we replay the raw emitted tokens.
+		resumeEnabled := builtinParser == nil
+
+		runCompletion := func(ctx context.Context, runner llm.LlamaServer, completionReq llm.CompletionRequest) error {
+			return runner.Completion(ctx, completionReq, func(cr llm.CompletionResponse) {
+				res := api.GenerateResponse{
+					Model:     req.Model,
+					CreatedAt: time.Now().UTC(),
+					Response:  cr.Content,
+					Done:      cr.Done,
+					Metrics: api.Metrics{
+						PromptEvalCount:    cr.PromptEvalCount,
+						PromptEvalDuration: cr.PromptEvalDuration,
+						EvalCount:          cr.EvalCount,
+						EvalDuration:       cr.EvalDuration,
+					},
+					Logprobs: toAPILogprobs(cr.Logprobs),
 				}
-				res.Response = content
-				res.Thinking = thinking
-				if cr.Done && len(toolCalls) > 0 {
-					res.ToolCalls = toolCalls
-				}
-			} else if thinkingState != nil {
-				thinking, content := thinkingState.AddContent(cr.Content)
-				res.Thinking = thinking
-				res.Response = content
-			}
 
-			if _, err := sb.WriteString(cr.Content); err != nil {
-				ch <- gin.H{"error": err.Error()}
-			}
-
-			if cr.Done {
-				res.DoneReason = cr.DoneReason.String()
-				res.TotalDuration = time.Since(checkpointStart)
-				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-
-				if !req.Raw {
-					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
+				if builtinParser != nil {
+					content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
 					if err != nil {
 						ch <- gin.H{"error": err.Error()}
 						return
 					}
-					res.Context = tokens
+					res.Response = content
+					res.Thinking = thinking
+					if cr.Done && len(toolCalls) > 0 {
+						res.ToolCalls = toolCalls
+					}
+				} else if thinkingState != nil {
+					thinking, content := thinkingState.AddContent(cr.Content)
+					res.Thinking = thinking
+					res.Response = content
 				}
+
+				if _, err := sb.WriteString(cr.Content); err != nil {
+					ch <- gin.H{"error": err.Error()}
+				}
+
+				// Track emitted prefix for best-effort resume.
+				// Use the raw model tokens so prompt replay stays faithful even when
+				// thinking tag parsing is enabled.
+				if resumeEnabled {
+					if _, err := prefix.WriteString(cr.Content); err != nil {
+						ch <- gin.H{"error": err.Error()}
+						return
+					}
+				}
+
+				if cr.Done {
+					res.DoneReason = cr.DoneReason.String()
+					res.TotalDuration = time.Since(checkpointStart)
+					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+
+					if !req.Raw {
+						tokens, err := r.Tokenize(c.Request.Context(), basePrompt+sb.String())
+						if err != nil {
+							ch <- gin.H{"error": err.Error()}
+							return
+						}
+						res.Context = tokens
+					}
+				}
+
+				if builtinParser != nil {
+					// only send messages with meaningful content (empty messages confuse clients)
+					if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 {
+						ch <- res
+					}
+
+					return
+				}
+
+				ch <- res
+			})
+		}
+
+		// Attempt completion and optionally resume once.
+		for {
+			err := runCompletion(runnerCtx, r, completionReq)
+			if err == nil {
+				break
 			}
 
-			if builtinParser != nil {
-				// only send messages with meaningful content (empty messages confuse clients)
-				if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 {
-					ch <- res
+			slog.Debug("completion failed", "endpoint", "generate", "resume_enabled", resumeEnabled, "attempted_resume", attemptedResume, "err", err)
+
+			// Best-effort resume: release the current runner and retry once with a more
+			// compatible context sizing and the already-emitted prefix appended.
+			if resumeEnabled && !attemptedResume && isRetryableCompletionError(c.Request.Context(), err) {
+				attemptedResume = true
+
+				resumeOpts := *opts
+				target, ok := kvGrowTargetNumCtx(err, opts)
+				if ok {
+					// Keep the existing max context length. The KV-grow target is the
+					// context length the runner was trying to *allocate up to* when it
+					// failed; lowering num_ctx here would cap future growth.
+					//
+					// If the computed target exceeds the current cap (should be rare),
+					// bump the cap up to at least the target.
+					resumeOpts.NumCtx = max(resumeOpts.NumCtx, target)
+					if resumeOpts.RunnerEnv == nil {
+						resumeOpts.RunnerEnv = make(map[string]string, 1)
+					}
+					// Force the retry runner to eagerly allocate the KV cache up to the
+					// required context length so the scheduler can pick a layout that
+					// actually supports it (instead of starting smaller and growing OOM again).
+					resumeOpts.RunnerEnv["OLLAMA_KV_CACHE_INIT"] = strconv.Itoa(target)
+
+					// Best-effort: try spreading layers across all GPUs on the retry.
+					// This can free VRAM on the primary GPU for KV cache growth.
+					resumeOpts.SchedSpread = true
+				}
+				slog.Debug(
+					"attempting best-effort resume",
+					"endpoint", "generate",
+					"prefix_len", prefix.Len(),
+					"base_prompt_len", len(basePrompt),
+					"num_ctx_before", opts.NumCtx,
+					"num_ctx_after", resumeOpts.NumCtx,
+					"kv_cache_init", target,
+					"sched_spread", resumeOpts.SchedSpread,
+					"kv_grow_target_ok", ok,
+				)
+
+				// Release the current runner reference before reacquiring.
+				runnerCancel()
+
+				// Attempt to align the requested context length with the KV growth target
+				// that triggered the failure (best-effort). This changes the runner load
+				// options, which forces the scheduler to provision a new layout.
+				resumeCtx, resumeCancel := context.WithCancel(c.Request.Context())
+				runnerCtx = resumeCtx
+				runnerCancel = resumeCancel
+
+				runnerCh, errCh := s.sched.GetRunner(resumeCtx, m, resumeOpts, req.KeepAlive)
+				var rr *runnerRef
+				select {
+				case rr = <-runnerCh:
+					if rr != nil {
+						r = rr.llama
+						checkpointLoaded = time.Now()
+						completionReq.Options = &resumeOpts
+						completionReq.Prompt = basePrompt + prefix.String()
+						slog.Debug("best-effort resume reacquired runner", "endpoint", "generate", "num_ctx", resumeOpts.NumCtx)
+						continue
+					}
+				case e := <-errCh:
+					err = e
 				}
 
-				return
+				slog.Debug("best-effort resume failed to reacquire runner", "endpoint", "generate", "err", err)
 			}
 
-			ch <- res
-		}); err != nil {
 			var serr api.StatusError
 			if errors.As(err, &serr) {
 				ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
 			} else {
 				ch <- gin.H{"error": err.Error()}
 			}
+			break
 		}
+
+		// Always release the runner reference when we're done.
+		runnerCancel()
 	}()
 
 	if req.Stream != nil && !*req.Stream {
@@ -1825,6 +1936,70 @@ func streamResponse(c *gin.Context, ch chan any) {
 	})
 }
 
+// kvGrowTargetNumCtx attempts to infer the KV cache growth target context length (tokens per
+// sequence) from a runner error.
+//
+// Today the runner reports KV growth OOM as:
+//
+//	"insufficient memory while expanding KV cache (cells <from> -> <to>, max <max>)"
+//
+// Where "cells" refers to total KV cells across all parallel slots. We infer the number of
+// slots from max/opts.NumCtx (best-effort) and return ceil(to/slots).
+func kvGrowTargetNumCtx(err error, opts *api.Options) (int, bool) {
+	if err == nil || opts == nil || opts.NumCtx <= 0 {
+		return 0, false
+	}
+
+	msg := err.Error()
+	var serr api.StatusError
+	if errors.As(err, &serr) && serr.ErrorMessage != "" {
+		msg = serr.ErrorMessage
+	}
+
+	// Very small, allocation-free parse without regex.
+	// Expected substring: "cells %d -> %d, max %d"
+	idx := strings.Index(msg, "cells ")
+	if idx < 0 {
+		return 0, false
+	}
+	msg = msg[idx+len("cells "):]
+
+	// from
+	fromEnd := strings.Index(msg, " -> ")
+	if fromEnd < 0 {
+		return 0, false
+	}
+	// ignore from cells
+	msg = msg[fromEnd+len(" -> "):]
+
+	toEnd := strings.Index(msg, ", max ")
+	if toEnd < 0 {
+		return 0, false
+	}
+	toCells, errTo := strconv.Atoi(strings.TrimSpace(msg[:toEnd]))
+	if errTo != nil || toCells <= 0 {
+		return 0, false
+	}
+	msg = msg[toEnd+len(", max "):]
+
+	maxEnd := strings.IndexByte(msg, ')')
+	if maxEnd < 0 {
+		maxEnd = len(msg)
+	}
+	maxCells, errMax := strconv.Atoi(strings.TrimSpace(msg[:maxEnd]))
+	if errMax != nil || maxCells <= 0 {
+		return 0, false
+	}
+
+	slots := max(1, maxCells/opts.NumCtx)
+	target := (toCells + slots - 1) / slots
+	if target <= 0 {
+		return 0, false
+	}
+
+	return target, true
+}
+
 func (s *Server) WhoamiHandler(c *gin.Context) {
 	// todo allow other hosts
 	u, err := url.Parse("https://ollama.com")
@@ -2170,11 +2345,16 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		}
 	}
 
-	r, m, opts, err := s.scheduleRunner(c.Request.Context(), name.String(), caps, req.Options, req.KeepAlive)
+	// Acquire the runner with a cancellable context so we can release it early
+	// (and potentially reacquire a different layout) without canceling the request.
+	runnerCtx, runnerCancel := context.WithCancel(c.Request.Context())
+	r, m, opts, err := s.scheduleRunner(runnerCtx, name.String(), caps, req.Options, req.KeepAlive)
 	if errors.Is(err, errCapabilityCompletion) {
+		runnerCancel()
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%q does not support chat", req.Model)})
 		return
 	} else if err != nil {
+		runnerCancel()
 		handleScheduleError(c, req.Model, err)
 		return
 	}
@@ -2273,9 +2453,24 @@ func (s *Server) ChatHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		currentCancel := runnerCancel
+		defer func() {
+			if currentCancel != nil {
+				currentCancel()
+			}
+		}()
+
+		// Best-effort resume is only enabled for the simple streaming path where
+		// we emit raw model tokens directly (no built-in parsers/tools/structured outputs).
+		// Thinking tag parsing is OK as long as we replay the raw emitted tokens.
+		resumeEnabled := builtinParser == nil && toolParser == nil && req.Format == nil
+		attemptedResume := false
+		var prefix strings.Builder
+		basePrompt := prompt
 
 		structuredOutputsState := structuredOutputsState_None
 
+	completionLoop:
 		for {
 			var tb strings.Builder
 
@@ -2294,8 +2489,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			}
 
 			// sets up new context given parent context per request
-			ctx, cancel := context.WithCancel(c.Request.Context())
-			err := r.Completion(ctx, llm.CompletionRequest{
+			ctx, cancel := context.WithCancel(runnerCtx)
+			completionReq := llm.CompletionRequest{
 				Prompt:      prompt,
 				Images:      images,
 				Format:      currentFormat,
@@ -2304,7 +2499,8 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Truncate:    truncate,
 				Logprobs:    req.Logprobs,
 				TopLogprobs: req.TopLogprobs,
-			}, func(r llm.CompletionResponse) {
+			}
+			err := r.Completion(ctx, completionReq, func(r llm.CompletionResponse) {
 				res := api.ChatResponse{
 					Model:     req.Model,
 					CreatedAt: time.Now().UTC(),
@@ -2407,12 +2603,84 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					}
 				}
 
+				if resumeEnabled {
+					if _, err := prefix.WriteString(r.Content); err != nil {
+						ch <- gin.H{"error": err.Error()}
+						return
+					}
+				}
+
 				ch <- res
 			})
 			if err != nil {
 				if structuredOutputsState == structuredOutputsState_ReadyToApply && strings.Contains(err.Error(), "context canceled") && c.Request.Context().Err() == nil {
 					// only ignores error if it's a context cancellation due to setting structured outputs
 				} else {
+					slog.Debug("completion failed", "endpoint", "chat", "resume_enabled", resumeEnabled, "attempted_resume", attemptedResume, "err", err)
+					if resumeEnabled && !attemptedResume && isRetryableCompletionError(c.Request.Context(), err) {
+						attemptedResume = true
+						cancel()
+						// Release the current runner before reacquiring.
+						if currentCancel != nil {
+							currentCancel()
+						}
+						resumeOpts := *opts
+						target, ok := kvGrowTargetNumCtx(err, opts)
+						if ok {
+							// Keep the existing max context length. The KV-grow target is the
+							// context length the runner was trying to *allocate up to* when it
+							// failed; lowering num_ctx here would cap future growth.
+							//
+							// If the computed target exceeds the current cap (should be rare),
+							// bump the cap up to at least the target.
+							resumeOpts.NumCtx = max(resumeOpts.NumCtx, target)
+							if resumeOpts.RunnerEnv == nil {
+								resumeOpts.RunnerEnv = make(map[string]string, 1)
+							}
+							// Force the retry runner to eagerly allocate the KV cache up to the
+							// required context length so the scheduler can pick a layout that
+							// actually supports it (instead of starting smaller and growing OOM again).
+							resumeOpts.RunnerEnv["OLLAMA_KV_CACHE_INIT"] = strconv.Itoa(target)
+
+							// Best-effort: try spreading layers across all GPUs on the retry.
+							// This can free VRAM on the primary GPU for KV cache growth.
+							resumeOpts.SchedSpread = true
+						}
+						slog.Debug(
+							"attempting best-effort resume",
+							"endpoint", "chat",
+							"prefix_len", prefix.Len(),
+							"base_prompt_len", len(basePrompt),
+							"num_ctx_before", opts.NumCtx,
+							"num_ctx_after", resumeOpts.NumCtx,
+							"kv_cache_init", target,
+							"sched_spread", resumeOpts.SchedSpread,
+							"kv_grow_target_ok", ok,
+						)
+						resumeCtx, resumeCancel := context.WithCancel(c.Request.Context())
+						runnerCtx = resumeCtx
+						currentCancel = resumeCancel
+
+						runnerCh, errCh := s.sched.GetRunner(resumeCtx, m, resumeOpts, req.KeepAlive)
+						var rr *runnerRef
+						select {
+						case rr = <-runnerCh:
+							if rr != nil {
+								r = rr.llama
+								checkpointLoaded = time.Now()
+								// Update prompt/options for the retry and start over.
+								prompt = basePrompt + prefix.String()
+								opts = &resumeOpts
+								slog.Debug("best-effort resume reacquired runner", "endpoint", "chat", "num_ctx", resumeOpts.NumCtx)
+								continue completionLoop
+							}
+						case e := <-errCh:
+							err = e
+						}
+
+						slog.Debug("best-effort resume failed to reacquire runner", "endpoint", "chat", "err", err)
+					}
+
 					var serr api.StatusError
 					if errors.As(err, &serr) {
 						ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}
@@ -2518,6 +2786,41 @@ func handleScheduleError(c *gin.Context, name string, err error) {
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
+}
+
+// isRetryableCompletionError returns true when a completion failure is likely to be
+// transient (e.g., runner died, allocator OOM) and worth a single best-effort retry.
+//
+// This is intentionally conservative: it should never retry on user cancellations.
+func isRetryableCompletionError(reqCtx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	// If the request was canceled, don't retry.
+	if errors.Is(err, context.Canceled) && reqCtx.Err() != nil {
+		return false
+	}
+
+	var serr api.StatusError
+	msg := ""
+	if errors.As(err, &serr) {
+		msg = serr.ErrorMessage
+	} else {
+		msg = err.Error()
+	}
+	msg = strings.ToLower(strings.TrimSpace(msg))
+
+	// Memory pressure / allocator failures.
+	if strings.Contains(msg, "out of memory") || strings.Contains(msg, "oom") || strings.Contains(msg, "no mem") || strings.Contains(msg, "insufficient memory") {
+		return true
+	}
+
+	// Runner/process/network glitches.
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "unexpected eof") || strings.Contains(msg, "broken pipe") {
+		return true
+	}
+
+	return false
 }
 
 func filterThinkTags(msgs []api.Message, m *Model) []api.Message {

@@ -261,12 +261,16 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 
 	gpuLibs := ml.LibraryPaths(gpus)
 	status := NewStatusWriter(os.Stderr)
+	extraEnvs := ml.GetVisibleDevicesEnv(gpus, false)
+	for k, v := range opts.RunnerEnv {
+		extraEnvs[k] = v
+	}
 	cmd, port, err := StartRunner(
 		tok != nil,
 		modelPath,
 		gpuLibs,
 		status,
-		ml.GetVisibleDevicesEnv(gpus, false),
+		extraEnvs,
 	)
 
 	s := llmServer{
@@ -940,6 +944,8 @@ func (s *llmServer) buildLayout(systemGPUs []ml.DeviceInfo, memory *ml.BackendMe
 	gpus := append(make([]ml.DeviceInfo, 0, len(systemGPUs)), systemGPUs...)
 	sort.Sort(sort.Reverse(ml.ByFreeMemory(gpus)))
 
+	spread := s.options.SchedSpread || envconfig.SchedSpread()
+
 	layers := make([]uint64, len(memory.CPU.Weights))
 	for i := range layers {
 		for j := range memory.GPUs {
@@ -989,7 +995,7 @@ func (s *llmServer) buildLayout(systemGPUs []ml.DeviceInfo, memory *ml.BackendMe
 			}
 		}
 
-		libraryGpuLayers := assignLayers(layers, gl, requireFull, s.options.NumGPU, lastUsedGPU)
+		libraryGpuLayers := assignLayers(layers, gl, requireFull, s.options.NumGPU, lastUsedGPU, spread)
 		if libraryGpuLayers.Sum() > gpuLayers.Sum() {
 			gpuLayers = libraryGpuLayers
 		}
@@ -1061,9 +1067,9 @@ nextLayer:
 }
 
 // assignLayers packs the maximum number of layers onto the smallest set of GPUs and comes up with a layer assignment
-func assignLayers(layers []uint64, gpus []ml.DeviceInfo, requireFull bool, requestedLayers int, lastUsedGPU int) (gpuLayers ml.GPULayersList) {
+func assignLayers(layers []uint64, gpus []ml.DeviceInfo, requireFull bool, requestedLayers int, lastUsedGPU int, spread bool) (gpuLayers ml.GPULayersList) {
 	// If the user is manually overriding parameters, treat all GPUs equally so they split according to VRAM
-	if requestedLayers >= 0 || envconfig.SchedSpread() {
+	if requestedLayers >= 0 || spread {
 		for i := range gpus {
 			gpus[i].Integrated = false
 		}
@@ -1074,7 +1080,7 @@ func assignLayers(layers []uint64, gpus []ml.DeviceInfo, requireFull bool, reque
 		// requestedLayers may be -1 if nothing was requested
 		requestedLayers = min(len(layers), requestedLayers)
 
-		if !envconfig.SchedSpread() {
+		if !spread {
 			for i := lastUsedGPU; i < len(gpus); i++ {
 				// Try to pack things into as few GPUs as possible
 				forceRequest := i == len(gpus)-1 && !requireFull
@@ -1485,6 +1491,8 @@ const (
 	DoneReasonLength
 	// DoneReasonConnectionClosed indicates the completion stopped due to the connection being closed
 	DoneReasonConnectionClosed
+	// DoneReasonError indicates the completion stopped due to an error
+	DoneReasonError
 )
 
 func (d DoneReason) String() string {
@@ -1493,6 +1501,8 @@ func (d DoneReason) String() string {
 		return "length"
 	case DoneReasonStop:
 		return "stop"
+	case DoneReasonError:
+		return "error"
 	default:
 		return "" // closed
 	}
@@ -1511,7 +1521,10 @@ type Logprob struct {
 }
 
 type CompletionResponse struct {
-	Content            string        `json:"content"`
+	Content string `json:"content"`
+	// Error is a human-readable message describing why generation stopped.
+	// When set, Done should also be true and DoneReason should be DoneReasonError.
+	Error              string        `json:"error,omitempty"`
 	DoneReason         DoneReason    `json:"done_reason"`
 	Done               bool          `json:"done"`
 	PromptEvalCount    int           `json:"prompt_eval_count"`
@@ -1671,6 +1684,9 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			}
 
 			if c.Done {
+				if c.Error != "" {
+					return api.StatusError{StatusCode: http.StatusInternalServerError, ErrorMessage: c.Error}
+				}
 				fn(c)
 				return nil
 			}

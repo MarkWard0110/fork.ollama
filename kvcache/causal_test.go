@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"errors"
 	"testing"
 
 	"github.com/ollama/ollama/ml"
@@ -28,6 +29,101 @@ func runPermutedVariants(t *testing.T, fn func(t *testing.T, backend *testBacken
 			fn(t, &testBackend{permutedV: permuted})
 		})
 	}
+}
+
+func TestDynamicGrowthOOMIsWrapped(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_DYNAMIC", "1")
+	// Small initial allocation so we grow quickly.
+	t.Setenv("OLLAMA_KV_CACHE_INIT", "4")
+	// Make growth large enough to trigger our synthetic OOM condition.
+	t.Setenv("OLLAMA_KV_CACHE_GROW", "64")
+
+	backend := &oomBackend{maxCells: 8}
+	cache := NewCausalCache(nil)
+	cache.Init(backend, ml.DTypeF32, 1, 128, 1)
+	stats := cache.Stats()
+	if stats.AllocatedCells != 4 {
+		t.Fatalf("expected initial allocated cells to be 4, got %d (max=%d)", stats.AllocatedCells, stats.MaxCells)
+	}
+
+	ctx := backend.NewContext()
+	cache.SetLayer(0)
+
+	// Fill the initially allocated cells and initialize the per-layer tensors via Put.
+	for pos := int32(0); pos < 4; pos++ {
+		batch := input.Batch{Positions: []int32{pos}, Sequences: []int{0}}
+		if err := cache.StartForward(ctx, batch, false); err != nil {
+			t.Fatalf("StartForward(pos=%d) unexpected error: %v", pos, err)
+		}
+
+		key := ctx.Empty(ml.DTypeF32, 2, 1, 1)
+		value := ctx.Empty(ml.DTypeF32, 2, 1, 1)
+		cache.Put(ctx, key, value)
+	}
+	{
+		emptyIdx := make([]int, 0)
+		for i := range cache.cells {
+			if len(cache.cells[i].sequences) == 0 {
+				emptyIdx = append(emptyIdx, i)
+			}
+		}
+		if len(emptyIdx) != 0 {
+			t.Fatalf("expected all initial cells to be occupied, found empty at %v", emptyIdx)
+		}
+	}
+
+	// Next token requires more cache cells and should attempt a grow, which OOMs.
+	batch := input.Batch{Positions: []int32{4}, Sequences: []int{0}}
+	err := cache.StartForward(ctx, batch, false)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var growErr ErrKvCacheGrow
+	if !errors.As(err, &growErr) {
+		t.Fatalf("expected ErrKvCacheGrow, got %T: %v", err, err)
+	}
+
+	var noMem ml.ErrNoMem
+	if !errors.As(err, &noMem) {
+		t.Fatalf("expected wrapped ml.ErrNoMem, got %T: %v", err, err)
+	}
+}
+
+type oomBackend struct {
+	ml.Backend
+	maxCells int
+}
+
+func (b *oomBackend) NewContext() ml.Context {
+	return &oomContext{maxCells: b.maxCells}
+}
+
+func (b *oomBackend) NewContextSize(int) ml.Context {
+	return &oomContext{maxCells: b.maxCells}
+}
+
+func (b *oomBackend) CacheConfig() ml.CacheConfig {
+	return ml.CacheConfig{}
+}
+
+type oomContext struct {
+	testContext
+	maxCells int
+}
+
+func (c *oomContext) Input() ml.Context    { return c }
+func (c *oomContext) Layer(int) ml.Context { return c }
+
+func (c *oomContext) Zeros(dtype ml.DType, shape ...int) ml.Tensor {
+	// The cache tensors use the last dimension as the cell count.
+	if len(shape) > 0 {
+		cells := shape[len(shape)-1]
+		if cells > c.maxCells {
+			panic(ml.ErrNoMem{})
+		}
+	}
+	return c.Empty(dtype, shape...)
 }
 
 func TestStore(t *testing.T) {
