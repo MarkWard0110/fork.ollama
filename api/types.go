@@ -613,6 +613,12 @@ type Runner struct {
 	// RunnerEnv provides per-runner environment variable overrides.
 	// It is not part of the public HTTP API surface.
 	RunnerEnv map[string]string `json:"-"`
+
+	// ForceEvictIdle tells the scheduler to evict all idle runners before
+	// loading this model, maximising available GPU memory. Used by the
+	// best-effort resume path after a KV cache growth OOM.
+	// It is not part of the public HTTP API surface.
+	ForceEvictIdle bool `json:"-"`
 }
 
 // EmbedRequest is the request passed to [Client.Embed].
