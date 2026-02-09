@@ -677,6 +677,23 @@ func (s *Server) computeBatch(activeBatch batchState) {
 	}
 	defer activeBatch.ctx.Close()
 
+	// Recover from OOM panics during compute (e.g. when KV cache growth
+	// exhausts VRAM and the graph buffer can no longer be allocated).
+	// Without this, a panic in the async compute goroutine crashes the process.
+	defer func() {
+		if r := recover(); r != nil {
+			if oomErr, ok := r.(ml.ErrNoMem); ok {
+				slog.Error("compute batch out of memory", "error", oomErr)
+				s.mu.Lock()
+				s.failBatch(activeBatch, oomErr)
+				s.mu.Unlock()
+			} else {
+				// Not an OOM - re-panic to preserve original behavior for real bugs
+				panic(r)
+			}
+		}
+	}()
+
 	// Wait until inputs are ready
 	logutil.Trace("computeBatch: waiting for inputs to be ready", "batchID", activeBatch.id)
 	<-activeBatch.inputsReadyCh

@@ -943,8 +943,8 @@ func ListRunningHandler(cmd *cobra.Command, args []string) error {
 			}
 			row = append(row, until)
 			if verbose {
-				if m.VRAMTotal > 0 {
-					row = append(row, fmt.Sprintf("%s/%s", format.HumanBytes(m.VRAMUsed), format.HumanBytes(m.VRAMTotal)))
+				if m.VRAMUsed > 0 {
+					row = append(row, format.HumanBytes(m.VRAMUsed))
 				} else {
 					row = append(row, "")
 				}
