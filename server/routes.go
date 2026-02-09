@@ -640,26 +640,22 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				attemptedResume = true
 
 				resumeOpts := *opts
-				target, ok := kvGrowTargetNumCtx(err, opts)
+				target, ok := kvGrowTargetNumCtx(err, opts, len(basePrompt))
 				if ok {
-					// Keep the existing max context length. The KV-grow target is the
-					// context length the runner was trying to *allocate up to* when it
-					// failed; lowering num_ctx here would cap future growth.
-					//
-					// If the computed target exceeds the current cap (should be rare),
-					// bump the cap up to at least the target.
 					resumeOpts.NumCtx = max(resumeOpts.NumCtx, target)
 					if resumeOpts.RunnerEnv == nil {
 						resumeOpts.RunnerEnv = make(map[string]string, 1)
 					}
-					// Force the retry runner to eagerly allocate the KV cache up to the
-					// required context length so the scheduler can pick a layout that
-					// actually supports it (instead of starting smaller and growing OOM again).
+					// Pre-allocate KV to the computed target so the scheduler
+					// sizes the layer layout with enough VRAM headroom.
 					resumeOpts.RunnerEnv["OLLAMA_KV_CACHE_INIT"] = strconv.Itoa(target)
 
-					// Best-effort: try spreading layers across all GPUs on the retry.
-					// This can free VRAM on the primary GPU for KV cache growth.
+					// Try spreading layers across all GPUs on the retry.
 					resumeOpts.SchedSpread = true
+
+					// Evict all idle runners before loading so the retry gets
+					// maximum available VRAM.
+					resumeOpts.ForceEvictIdle = true
 				}
 				slog.Debug(
 					"attempting best-effort resume",
@@ -1936,16 +1932,29 @@ func streamResponse(c *gin.Context, ch chan any) {
 	})
 }
 
-// kvGrowTargetNumCtx attempts to infer the KV cache growth target context length (tokens per
-// sequence) from a runner error.
-//
-// Today the runner reports KV growth OOM as:
+// kvGrowTargetNumCtx computes a per-sequence context size for a best-effort
+// resume after a KV-grow OOM.  It parses the runner error
 //
 //	"insufficient memory while expanding KV cache (cells <from> -> <to>, max <max>)"
 //
-// Where "cells" refers to total KV cells across all parallel slots. We infer the number of
-// slots from max/opts.NumCtx (best-effort) and return ceil(to/slots).
-func kvGrowTargetNumCtx(err error, opts *api.Options) (int, bool) {
+// and returns a target that is large enough to accommodate the current prompt
+// without being so large that the scheduler cannot fit the model+KV in the
+// available VRAM + system RAM.
+//
+// The heuristic is:
+//
+//	target = min(max(toCells*2, estimatedPromptTokens), maxCells) / slots
+//
+// where estimatedPromptTokens ≈ promptCharLen/3 (conservative over-estimate;
+// most tokenizers average ≈ 4 chars/token so dividing by 3 biases upward).
+//
+// This avoids the two failure extremes:
+//   - Using toCells alone is too small — the runner OOMs on the very first
+//     grow because the scheduler left no VRAM headroom.
+//   - Using maxCells alone can be too large — e.g. a 131 K-cell KV for a 70B
+//     model is ≈ 40 GiB of KV cache, forcing massive layer offload that may
+//     exceed available system RAM.
+func kvGrowTargetNumCtx(err error, opts *api.Options, promptCharLen int) (int, bool) {
 	if err == nil || opts == nil || opts.NumCtx <= 0 {
 		return 0, false
 	}
@@ -1992,7 +2001,20 @@ func kvGrowTargetNumCtx(err error, opts *api.Options) (int, bool) {
 	}
 
 	slots := max(1, maxCells/opts.NumCtx)
-	target := (toCells + slots - 1) / slots
+
+	// Estimate the minimum token count from the prompt character length.
+	// Dividing by 3 is a deliberate over-estimate (most tokenizers average
+	// ≈ 4 chars/token); this biases upward so we don't under-allocate.
+	estimatedTokens := 0
+	if promptCharLen > 0 {
+		estimatedTokens = (promptCharLen + 2) / 3
+	}
+
+	// Pick a base that doubles the failed grow target (ensuring meaningful
+	// headroom) or uses the estimated prompt token count — whichever is
+	// larger — then cap at the model's maximum.
+	base := min(max(toCells*2, estimatedTokens), maxCells)
+	target := (base + slots - 1) / slots // ceiling division
 	if target <= 0 {
 		return 0, false
 	}
@@ -2141,8 +2163,13 @@ func (s *Server) PsHandler(c *gin.Context) {
 					cpuSize = staticCPU + currentCacheCPU
 				}
 
-				// Update Size to reflect current total footprint (GPU + CPU)
+				// Update Size and SizeVRAM to reflect current total footprint.
+				// SizeVRAM must track the scaled vramUsed so the PROCESSOR column
+				// (derived from Size vs SizeVRAM) stays consistent. Without this,
+				// KV cache growth inflates Size while SizeVRAM stays at the load-time
+				// value, creating a phantom "CPU %" even if everything is in VRAM.
 				mr.Size = int64(vramUsed + cpuSize)
+				mr.SizeVRAM = int64(vramUsed)
 
 				// Report RAM if there's any CPU component
 				if cpuSize > 0 {
@@ -2165,6 +2192,16 @@ func (s *Server) PsHandler(c *gin.Context) {
 								total += d.TotalMemory
 							}
 						}
+					}
+
+					// GPU total memory is static hardware info.  Cache it on
+					// success so that a timeout during busy inference doesn't
+					// cause the display to flicker (showing used/used instead
+					// of used/total).
+					if total > 0 {
+						v.gpuTotalMemory = total
+					} else {
+						total = v.gpuTotalMemory
 					}
 
 					if vramUsed > 0 {
@@ -2671,26 +2708,22 @@ func (s *Server) ChatHandler(c *gin.Context) {
 							currentCancel()
 						}
 						resumeOpts := *opts
-						target, ok := kvGrowTargetNumCtx(err, opts)
+						target, ok := kvGrowTargetNumCtx(err, opts, len(basePrompt))
 						if ok {
-							// Keep the existing max context length. The KV-grow target is the
-							// context length the runner was trying to *allocate up to* when it
-							// failed; lowering num_ctx here would cap future growth.
-							//
-							// If the computed target exceeds the current cap (should be rare),
-							// bump the cap up to at least the target.
 							resumeOpts.NumCtx = max(resumeOpts.NumCtx, target)
 							if resumeOpts.RunnerEnv == nil {
 								resumeOpts.RunnerEnv = make(map[string]string, 1)
 							}
-							// Force the retry runner to eagerly allocate the KV cache up to the
-							// required context length so the scheduler can pick a layout that
-							// actually supports it (instead of starting smaller and growing OOM again).
+							// Pre-allocate KV to the computed target so the scheduler
+							// sizes the layer layout with enough VRAM headroom.
 							resumeOpts.RunnerEnv["OLLAMA_KV_CACHE_INIT"] = strconv.Itoa(target)
 
-							// Best-effort: try spreading layers across all GPUs on the retry.
-							// This can free VRAM on the primary GPU for KV cache growth.
+							// Try spreading layers across all GPUs on the retry.
 							resumeOpts.SchedSpread = true
+
+							// Evict all idle runners before loading so the retry gets
+							// maximum available VRAM.
+							resumeOpts.ForceEvictIdle = true
 						}
 						slog.Debug(
 							"attempting best-effort resume",

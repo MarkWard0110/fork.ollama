@@ -485,8 +485,8 @@ func TestGenerateBestEffortResumeKeepsMaxNumCtxWhenTargetLower(t *testing.T) {
 	if loadOpts[1].NumCtx != 8192 {
 		t.Fatalf("expected retry scheduler load to keep max num_ctx=%d, got %d", 8192, loadOpts[1].NumCtx)
 	}
-	if got := loadOpts[1].RunnerEnv["OLLAMA_KV_CACHE_INIT"]; got != "5120" {
-		t.Fatalf("expected retry scheduler load RunnerEnv OLLAMA_KV_CACHE_INIT=5120, got %q", got)
+	if got := loadOpts[1].RunnerEnv["OLLAMA_KV_CACHE_INIT"]; got != "8192" {
+		t.Fatalf("expected retry scheduler load RunnerEnv OLLAMA_KV_CACHE_INIT=8192 (max capacity), got %q", got)
 	}
 }
 

@@ -233,16 +233,26 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						break
 					}
 
-					// More than one loaded model, so we have to see if the
-					// new one fits
-					logutil.Trace("loading additional model", "model", pending.model.ModelPath)
-					needEvict := s.loadFn(pending, ggml, systemInfo, gpus, true)
-					if !needEvict {
-						slog.Debug("new model fits with existing models, loading")
-						break
-					}
+					// When ForceEvictIdle is set (e.g. after a KV cache OOM resume),
+					// skip the fit check and eagerly evict idle runners to maximise
+					// available VRAM. The eviction loop will remove one runner at a
+					// time; on the next iteration loadedCount drops and we eventually
+					// reach loadedCount==0 where the model loads with full resources.
+					if pending.opts.ForceEvictIdle {
+						slog.Debug("force evicting idle runners to maximise VRAM for OOM retry", "loaded_count", loadedCount)
+						runnerToExpire = s.findRunnerToUnload()
+					} else {
+						// More than one loaded model, so we have to see if the
+						// new one fits
+						logutil.Trace("loading additional model", "model", pending.model.ModelPath)
+						needEvict := s.loadFn(pending, ggml, systemInfo, gpus, true)
+						if !needEvict {
+							slog.Debug("new model fits with existing models, loading")
+							break
+						}
 
-					runnerToExpire = s.findRunnerToUnload()
+						runnerToExpire = s.findRunnerToUnload()
+					}
 				}
 
 				if runnerToExpire == nil {
@@ -662,13 +672,14 @@ type runnerRef struct {
 	refMu    sync.Mutex
 	refCount uint // prevent unloading if > 0
 
-	llama        llm.LlamaServer
-	pid          int
-	loading      bool          // True only during initial load, then false forever
-	gpus         []ml.DeviceID // Recorded at time of provisioning
-	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
-	vramSize     uint64
-	totalSize    uint64
+	llama          llm.LlamaServer
+	pid            int
+	loading        bool          // True only during initial load, then false forever
+	gpus           []ml.DeviceID // Recorded at time of provisioning
+	discreteGPUs   bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
+	vramSize       uint64
+	totalSize      uint64
+	gpuTotalMemory uint64 // Cached sum of TotalMemory for assigned GPUs (static hw info)
 
 	sessionDuration time.Duration
 	expireTimer     *time.Timer
@@ -745,6 +756,8 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	}
 	optsExisting.RunnerEnv = nil
 	optsNew.RunnerEnv = nil
+	optsExisting.ForceEvictIdle = false
+	optsNew.ForceEvictIdle = false
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
