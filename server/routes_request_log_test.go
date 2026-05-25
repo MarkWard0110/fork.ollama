@@ -86,6 +86,14 @@ func TestInferenceRequestLoggerMiddlewareWritesReplayArtifacts(t *testing.T) {
 	if !strings.Contains(curlString, "@\"${SCRIPT_DIR}/"+bodyFileName+"\"") {
 		t.Fatalf("curl log does not reference sibling body file: %s", curlString)
 	}
+
+	responseFiles, err := filepath.Glob(filepath.Join(logDir, "*_v1_chat_completions_response.json"))
+	if err != nil {
+		t.Fatalf("failed to glob response logs: %v", err)
+	}
+	if len(responseFiles) != 1 {
+		t.Fatalf("expected 1 response log, got %d (%v)", len(responseFiles), responseFiles)
+	}
 }
 
 func TestNewInferenceRequestLoggerCreatesDirectory(t *testing.T) {
@@ -124,5 +132,158 @@ func TestSanitizeRouteForFilename(t *testing.T) {
 		if got := sanitizeRouteForFilename(tt.route); got != tt.want {
 			t.Fatalf("sanitizeRouteForFilename(%q) = %q, want %q", tt.route, got, tt.want)
 		}
+	}
+}
+
+func TestResponseCaptureNonStreaming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logDir := t.TempDir()
+	requestLogger := &inferenceRequestLogger{dir: logDir}
+
+	const route = "/api/chat"
+	const requestBody = `{"model":"test-model","messages":[{"role":"user","content":"hello"}]}`
+	expectedResponse := `{"model":"test-model","message":{"role":"assistant","content":"Hello!"}}`
+
+	r := gin.New()
+	r.POST(route, requestLogger.middleware(route), func(c *gin.Context) {
+		c.Header("Content-Type", "application/json")
+		c.String(http.StatusOK, expectedResponse)
+	})
+
+	req := httptest.NewRequest(http.MethodPost, route, strings.NewReader(requestBody))
+	req.Host = "127.0.0.1:11434"
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	responseFiles, err := filepath.Glob(filepath.Join(logDir, "*_api_chat_response.json"))
+	if err != nil {
+		t.Fatalf("failed to glob response logs: %v", err)
+	}
+	if len(responseFiles) != 1 {
+		t.Fatalf("expected 1 response log, got %d (%v)", len(responseFiles), responseFiles)
+	}
+
+	responseData, err := os.ReadFile(responseFiles[0])
+	if err != nil {
+		t.Fatalf("failed to read response log: %v", err)
+	}
+	if string(responseData) != expectedResponse {
+		t.Fatalf("response log mismatch:\nexpected: %s\ngot: %s", expectedResponse, string(responseData))
+	}
+}
+
+func TestResponseCaptureStreaming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logDir := t.TempDir()
+	requestLogger := &inferenceRequestLogger{dir: logDir}
+
+	const route = "/api/generate"
+	const requestBody = `{"model":"test-model","prompt":"hello","stream":true}`
+	chunk1 := `{"model":"test-model","response":"He"}`
+	chunk2 := `{"model":"test-model","response":"llo"}`
+	chunk3 := `{"model":"test-model","response":"","done":true}`
+
+	r := gin.New()
+	r.POST(route, requestLogger.middleware(route), func(c *gin.Context) {
+		c.Header("Content-Type", "application/x-ndjson")
+		c.Writer.Write([]byte(chunk1 + "\n"))
+		c.Writer.Flush()
+		c.Writer.Write([]byte(chunk2 + "\n"))
+		c.Writer.Flush()
+		c.Writer.Write([]byte(chunk3 + "\n"))
+		c.Writer.Flush()
+	})
+
+	req := httptest.NewRequest(http.MethodPost, route, strings.NewReader(requestBody))
+	req.Host = "127.0.0.1:11434"
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	responseFiles, err := filepath.Glob(filepath.Join(logDir, "*_api_generate_response.jsonl"))
+	if err != nil {
+		t.Fatalf("failed to glob response logs: %v", err)
+	}
+	if len(responseFiles) != 1 {
+		t.Fatalf("expected 1 response log, got %d (%v)", len(responseFiles), responseFiles)
+	}
+
+	responseData, err := os.ReadFile(responseFiles[0])
+	if err != nil {
+		t.Fatalf("failed to read response log: %v", err)
+	}
+
+	responseStr := string(responseData)
+	if !strings.Contains(responseStr, chunk1) {
+		t.Fatalf("response log missing chunk1:\n%s", responseStr)
+	}
+	if !strings.Contains(responseStr, chunk2) {
+		t.Fatalf("response log missing chunk2:\n%s", responseStr)
+	}
+	if !strings.Contains(responseStr, chunk3) {
+		t.Fatalf("response log missing chunk3:\n%s", responseStr)
+	}
+}
+
+func TestResponseCaptureError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logDir := t.TempDir()
+	requestLogger := &inferenceRequestLogger{dir: logDir}
+
+	const route = "/v1/chat/completions"
+	const requestBody = `{"model":"nonexistent","messages":[{"role":"user","content":"hello"}]}`
+
+	r := gin.New()
+	r.POST(route, requestLogger.middleware(route), func(c *gin.Context) {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "model not found"})
+	})
+
+	req := httptest.NewRequest(http.MethodPost, route, strings.NewReader(requestBody))
+	req.Host = "127.0.0.1:11434"
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", w.Code)
+	}
+
+	responseFiles, err := filepath.Glob(filepath.Join(logDir, "*_v1_chat_completions_response.json"))
+	if err != nil {
+		t.Fatalf("failed to glob response logs: %v", err)
+	}
+	if len(responseFiles) != 1 {
+		t.Fatalf("expected 1 response log, got %d (%v)", len(responseFiles), responseFiles)
+	}
+
+	responseData, err := os.ReadFile(responseFiles[0])
+	if err != nil {
+		t.Fatalf("failed to read response log: %v", err)
+	}
+	if !strings.Contains(string(responseData), "model not found") {
+		t.Fatalf("response log does not contain error message:\n%s", string(responseData))
+	}
+}
+
+func TestExtractJSONFromSSE(t *testing.T) {
+	sseInput := []byte("data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\ndata: [DONE]\n\n")
+
+	expected := []byte("{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n{\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n")
+
+	got := extractJSONFromSSE(sseInput)
+	if string(got) != string(expected) {
+		t.Fatalf("extractJSONFromSSE failed:\nexpected: %q\n     got: %q", string(expected), string(got))
 	}
 }

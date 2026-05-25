@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +23,77 @@ import (
 type inferenceRequestLogger struct {
 	dir     string
 	counter uint64
+}
+
+type responseCaptureWriter struct {
+	http.ResponseWriter
+	body    bytes.Buffer
+	status  int
+	written bool
+}
+
+func (w *responseCaptureWriter) WriteHeader(statusCode int) {
+	w.status = statusCode
+	w.written = true
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseCaptureWriter) Write(data []byte) (int, error) {
+	w.body.Write(data)
+	w.written = true
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *responseCaptureWriter) WriteString(s string) (int, error) {
+	w.body.WriteString(s)
+	w.written = true
+	n, err := w.ResponseWriter.Write([]byte(s))
+	return n, err
+}
+
+func (w *responseCaptureWriter) Flush() {
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *responseCaptureWriter) Status() int {
+	return w.status
+}
+
+func (w *responseCaptureWriter) Written() bool {
+	return w.written
+}
+
+func (w *responseCaptureWriter) CloseNotify() <-chan bool {
+	if notifier, ok := w.ResponseWriter.(http.CloseNotifier); ok {
+		return notifier.CloseNotify()
+	}
+	return nil
+}
+
+func (w *responseCaptureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, errors.New("hijack not supported")
+}
+
+func (w *responseCaptureWriter) Pusher() (pusher http.Pusher) {
+	if p, ok := w.ResponseWriter.(interface{ Pusher() http.Pusher }); ok {
+		return p.Pusher()
+	}
+	return nil
+}
+
+func (w *responseCaptureWriter) Size() int {
+	return w.body.Len()
+}
+
+func (w *responseCaptureWriter) WriteHeaderNow() {
+	if !w.written {
+		w.WriteHeader(w.status)
+	}
 }
 
 func newInferenceRequestLogger() (*inferenceRequestLogger, error) {
@@ -79,12 +154,17 @@ func (l *inferenceRequestLogger) middleware(route string) gin.HandlerFunc {
 			}
 		}
 
+		originalWriter := c.Writer
+		captureWriter := &responseCaptureWriter{ResponseWriter: originalWriter, status: http.StatusOK}
+		c.Writer = captureWriter
+
 		c.Next()
-		l.log(route, method, scheme, host, contentType, body)
+		responseContentType := c.Writer.Header().Get("Content-Type")
+		l.log(route, method, scheme, host, contentType, body, captureWriter.body.Bytes(), responseContentType)
 	}
 }
 
-func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType string, body []byte) {
+func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType string, body []byte, responseBody []byte, responseContentType string) {
 	if l == nil || l.dir == "" {
 		return
 	}
@@ -106,11 +186,30 @@ func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType st
 	timestamp := fmt.Sprintf("%s-%06d", time.Now().UTC().Format("20060102T150405.000000000Z"), atomic.AddUint64(&l.counter, 1))
 	bodyFilename := fmt.Sprintf("%s_%s_body.json", timestamp, routeForFilename)
 	curlFilename := fmt.Sprintf("%s_%s_request.sh", timestamp, routeForFilename)
+
+	// Use .jsonl for streaming responses (NDJSON or SSE), .json for single-object responses
+	responseExt := "json"
+	if strings.Contains(responseContentType, "ndjson") || strings.Contains(responseContentType, "event-stream") {
+		responseExt = "jsonl"
+	}
+	// For SSE responses, strip "data: " prefixes to produce valid JSONL
+	responseDataToLog := responseBody
+	if strings.Contains(responseContentType, "event-stream") {
+		responseDataToLog = extractJSONFromSSE(responseBody)
+	}
+	responseFilename := fmt.Sprintf("%s_%s_response.%s", timestamp, routeForFilename, responseExt)
+
 	bodyPath := filepath.Join(l.dir, bodyFilename)
 	curlPath := filepath.Join(l.dir, curlFilename)
+	responsePath := filepath.Join(l.dir, responseFilename)
 
 	if err := os.WriteFile(bodyPath, body, 0o600); err != nil {
 		slog.Warn("failed to write debug request body", "route", route, "error", err)
+		return
+	}
+
+	if err := os.WriteFile(responsePath, responseDataToLog, 0o600); err != nil {
+		slog.Warn("failed to write debug response body", "route", route, "error", err)
 		return
 	}
 
@@ -121,7 +220,7 @@ func (l *inferenceRequestLogger) log(route, method, scheme, host, contentType st
 		return
 	}
 
-	slog.Info(fmt.Sprintf("logged to %s, replay using curl with `sh %s`", bodyPath, curlPath))
+	slog.Info(fmt.Sprintf("logged to %s and %s, replay using curl with `sh %s`", bodyPath, responsePath, curlPath))
 }
 
 func sanitizeRouteForFilename(route string) string {
@@ -141,4 +240,21 @@ func sanitizeRouteForFilename(route string) string {
 	}
 
 	return b.String()
+}
+
+// extractJSONFromSSE strips SSE "data: " prefixes from streaming responses
+// to produce valid JSONL. It ignores "data: [DONE]" and comment/other event lines.
+func extractJSONFromSSE(data []byte) []byte {
+	var result bytes.Buffer
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		lineStr := strings.TrimSpace(string(line))
+		if strings.HasPrefix(lineStr, "data: ") {
+			jsonData := strings.TrimPrefix(lineStr, "data: ")
+			if jsonData != "[DONE]" {
+				result.WriteString(jsonData)
+				result.WriteByte('\n')
+			}
+		}
+	}
+	return result.Bytes()
 }
