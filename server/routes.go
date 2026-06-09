@@ -158,6 +158,12 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 		opts.DraftNumPredict = 0
 	}
 
+	// When llamacpp_ctx_size is set in the model manifest, the runner's context
+	// budget is fixed at load time. Reject client requests that exceed it.
+	if opts.LlamaCppCtxSize > 0 && opts.NumCtx > opts.LlamaCppCtxSize {
+		return api.Options{}, fmt.Errorf("num_ctx %d exceeds model's llamacpp_ctx_size %d", opts.NumCtx, opts.LlamaCppCtxSize)
+	}
+
 	return opts, nil
 }
 
