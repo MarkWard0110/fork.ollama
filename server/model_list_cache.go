@@ -360,6 +360,18 @@ func buildModelListSummary(name model.Name, mf *manifest.Manifest) (modelListSum
 		}
 	}
 
+	// If llamacpp_ctx_size is set in the model manifest, it defines the runner's
+	// actual context budget. Clamp the reported context length so clients don't
+	// receive a value higher than what the server will accept.
+	params := readModelListParams(mf)
+	if params != nil {
+		if llamacppCtxSize, ok := params["llamacpp_ctx_size"].(float64); ok && llamacppCtxSize > 0 {
+			if int(llamacppCtxSize) < summary.Details.ContextLength {
+				summary.Details.ContextLength = int(llamacppCtxSize)
+			}
+		}
+	}
+
 	for _, c := range cfg.Capabilities {
 		summary.Capabilities = appendModelListCapability(summary.Capabilities, model.Capability(c))
 	}
@@ -416,6 +428,41 @@ func readModelListConfig(mf *manifest.Manifest) (model.ConfigV2, error) {
 	}
 
 	return cfg, nil
+}
+
+// readModelListParams reads the params blob from the manifest layers and returns
+// the parsed parameter map. Returns an empty map if no params layer exists or
+// on any read/decode error (non-fatal degradation).
+func readModelListParams(mf *manifest.Manifest) map[string]any {
+	if mf == nil {
+		return nil
+	}
+
+	for _, layer := range mf.Layers {
+		if layer.MediaType != "application/vnd.ollama.image.params" {
+			continue
+		}
+
+		filename, err := manifest.BlobsPath(layer.Digest)
+		if err != nil {
+			return nil
+		}
+
+		f, err := os.Open(filename)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
+		var params map[string]any
+		if err := json.NewDecoder(f).Decode(&params); err != nil {
+			return nil
+		}
+
+		return params
+	}
+
+	return nil
 }
 
 func readModelListLayers(mf *manifest.Manifest, summary *modelListSummary) (string, int, *ollamatemplate.Template, error) {
