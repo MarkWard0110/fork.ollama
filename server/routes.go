@@ -159,9 +159,14 @@ func (s *Server) modelOptionsWithEmbeddingBatchDefault(model *Model, requestOpts
 	}
 
 	// When llamacpp_ctx_size is set in the model manifest, the runner's context
-	// budget is fixed at load time. Reject client requests that exceed it.
+	// budget is fixed at load time. If the client explicitly requested a num_ctx
+	// that exceeds it, reject with an error. If only the server default exceeded
+	// it (i.e., the client did not specify num_ctx), silently cap it down instead.
 	if opts.LlamaCppCtxSize > 0 && opts.NumCtx > opts.LlamaCppCtxSize {
-		return api.Options{}, fmt.Errorf("num_ctx %d exceeds model's llamacpp_ctx_size %d", opts.NumCtx, opts.LlamaCppCtxSize)
+		if hasOption(requestOpts, "num_ctx") {
+			return api.Options{}, fmt.Errorf("num_ctx %d exceeds model's llamacpp_ctx_size %d", opts.NumCtx, opts.LlamaCppCtxSize)
+		}
+		opts.NumCtx = opts.LlamaCppCtxSize
 	}
 
 	return opts, nil
@@ -1377,6 +1382,7 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 		Families:          m.Config.ModelFamilies,
 		ParameterSize:     m.Config.ModelType,
 		QuantizationLevel: m.Config.FileType,
+		ContextLength:     m.Config.ContextLen,
 	}
 
 	// For image generation models, populate details from imagegen package
@@ -1402,6 +1408,16 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 		if modelDetails.QuantizationLevel == "" {
 			if dtype, err := xserver.GetSafetensorsDtype(name); err == nil && dtype != "" {
 				modelDetails.QuantizationLevel = dtype
+			}
+		}
+	}
+
+	// Clamp context_length to llamacpp_ctx_size if set, so the reported value
+	// does not exceed what the runner will actually allow.
+	if modelDetails.ContextLength > 0 {
+		if llamacppCtxSize, ok := m.Options["llamacpp_ctx_size"].(float64); ok && llamacppCtxSize > 0 {
+			if int(llamacppCtxSize) < modelDetails.ContextLength {
+				modelDetails.ContextLength = int(llamacppCtxSize)
 			}
 		}
 	}
@@ -1537,6 +1553,21 @@ func GetModelInfo(req api.ShowRequest) (*api.ShowResponse, error) {
 
 	delete(kvData, "general.name")
 	delete(kvData, "tokenizer.chat_template")
+
+	// Clamp any <arch>.context_length keys in model_info to llamacpp_ctx_size
+	// so clients don't receive a value higher than what the runner will allow.
+	if llamacppCtxSize, ok := m.Options["llamacpp_ctx_size"].(float64); ok && llamacppCtxSize > 0 {
+		for k := range kvData {
+			if strings.HasSuffix(k, ".context_length") {
+				if val, ok := kvData[k].(uint32); ok && float64(val) > llamacppCtxSize {
+					kvData[k] = uint32(llamacppCtxSize)
+				} else if val, ok := kvData[k].(uint64); ok && float64(val) > llamacppCtxSize {
+					kvData[k] = uint64(llamacppCtxSize)
+				}
+			}
+		}
+	}
+
 	resp.ModelInfo = kvData
 
 	tensorData := make([]api.Tensor, len(tensors.Items()))

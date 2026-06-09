@@ -218,6 +218,107 @@ func TestModelListCacheSyncDropsStaleEntryOnRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestModelListCacheClampsContextLengthWithLlamaCppCtxSize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with a large trained context length (131072)
+	_, digest := createBinFile(t, map[string]any{
+		"test.context_length": uint32(131072),
+	}, nil)
+
+	var s Server
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "list-clamp",
+		Files:  map[string]string{"model.gguf": digest},
+		Stream: &stream,
+		Parameters: map[string]any{
+			"llamacpp_ctx_size": float64(32768),
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create model status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	cache := newModelListCache()
+	if err := cache.hydrate(context.Background()); err != nil {
+		t.Fatalf("hydrate failed: %v", err)
+	}
+
+	summary, ok := cache.Get(model.ParseName("list-clamp"))
+	if !ok {
+		t.Fatal("list summary missing")
+	}
+
+	// Should be clamped to llamacpp_ctx_size (32768), not the trained max (131072)
+	if summary.Details.ContextLength != 32768 {
+		t.Fatalf("context length = %d, want 32768 (clamped by llamacpp_ctx_size)", summary.Details.ContextLength)
+	}
+}
+
+func TestModelListCacheNoClampWithoutLlamaCppCtxSize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with no llamacpp_ctx_size parameter
+	createListCacheModel(t, "list-no-clamp", map[string]any{
+		"test.context_length": uint32(131072),
+	}, "")
+
+	cache := newModelListCache()
+	if err := cache.hydrate(context.Background()); err != nil {
+		t.Fatalf("hydrate failed: %v", err)
+	}
+
+	summary, ok := cache.Get(model.ParseName("list-no-clamp"))
+	if !ok {
+		t.Fatal("list summary missing")
+	}
+
+	// Should report full trained context length when no llamacpp_ctx_size is set
+	if summary.Details.ContextLength != 131072 {
+		t.Fatalf("context length = %d, want 131072 (no clamp)", summary.Details.ContextLength)
+	}
+}
+
+func TestModelListCacheClampHigherThanTrainedNoEffect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with trained context 4096 and llamacpp_ctx_size higher (8192)
+	_, digest := createBinFile(t, map[string]any{
+		"test.context_length": uint32(4096),
+	}, nil)
+
+	var s Server
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "list-clamp-high",
+		Files:  map[string]string{"model.gguf": digest},
+		Stream: &stream,
+		Parameters: map[string]any{
+			"llamacpp_ctx_size": float64(8192),
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create model status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	cache := newModelListCache()
+	if err := cache.hydrate(context.Background()); err != nil {
+		t.Fatalf("hydrate failed: %v", err)
+	}
+
+	summary, ok := cache.Get(model.ParseName("list-clamp-high"))
+	if !ok {
+		t.Fatal("list summary missing")
+	}
+
+	// Trained max (4096) takes precedence when llamacpp_ctx_size is higher
+	if summary.Details.ContextLength != 4096 {
+		t.Fatalf("context length = %d, want 4096 (trained max)", summary.Details.ContextLength)
+	}
+}
+
 func createListCacheModel(t *testing.T, name string, kv map[string]any, tmpl string) {
 	t.Helper()
 	_, digest := createBinFile(t, kv, nil)
