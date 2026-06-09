@@ -328,6 +328,12 @@ func contextShiftPromptLimit(numCtx, numKeep int) int {
 }
 
 func (s *llamaServerRunner) ContextLength() int {
+	// When llamacpp_ctx_size is set, it defines the runner's actual context budget.
+	// Return that instead of the client-requested num_ctx so the scheduler can
+	// correctly track the runner shape and report accurate context size.
+	if s.options.LlamaCppCtxSize > 0 {
+		return s.options.LlamaCppCtxSize
+	}
 	return s.options.NumCtx
 }
 
@@ -363,13 +369,21 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 
 	// Build CLI flags — minimal set, let llama-server auto-detect the rest
+	// If llamacpp_ctx_size is set in the model manifest, use it as the runner's
+	// total context budget instead of the client-requested num_ctx. This decouples
+	// runner shape from per-request options so client num_ctx changes don't trigger reloads.
+	contextSize := launch.opts.NumCtx * launch.numParallel
+	if launch.opts.LlamaCppCtxSize > 0 {
+		contextSize = launch.opts.LlamaCppCtxSize * launch.numParallel
+	}
+
 	params := []string{
 		"--model", launch.modelPath,
 		"--port", strconv.Itoa(port),
 		"--host", "127.0.0.1",
 		"--no-webui",
 		"--offline",
-		"-c", strconv.Itoa(launch.opts.NumCtx * launch.numParallel),
+		"-c", strconv.Itoa(contextSize),
 		"-np", strconv.Itoa(launch.numParallel),
 	}
 	params = appendLlamaServerLogArgs(params)
@@ -416,6 +430,13 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	}
 
 	params = appendMainGPUArgs(params, launch.opts)
+
+	// Split mode and tensor split — only pass if not already set by appendMainGPUArgs.
+	// When MainGPU is set, appendMainGPUArgs handles split_mode; otherwise these apply.
+	if launch.opts.MainGPU == nil {
+		params = appendSplitModeArgs(params, launch.opts)
+	}
+	params = appendTensorSplitArgs(params, launch.opts)
 
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
 
@@ -626,7 +647,57 @@ func appendMainGPUArgs(params []string, opts api.Options) []string {
 		return params
 	}
 
-	return append(params, "--split-mode", "none", "--main-gpu", strconv.Itoa(*opts.MainGPU))
+	// Only default to split-mode none if the user did not explicitly set SplitMode.
+	// If SplitMode is set (e.g., "layer" or "row"), respect it and let llama.cpp
+	// distribute tensors across GPUs even when MainGPU is specified.
+	splitMode := opts.LlamaCppSplitMode
+	if splitMode == "" {
+		splitMode = "none"
+	}
+
+	return append(params, "--split-mode", splitMode, "--main-gpu", strconv.Itoa(*opts.MainGPU))
+}
+
+// validSplitModes are the split-mode values accepted by llama.cpp.
+var validSplitModes = map[string]bool{
+	"none":  true,
+	"layer": true,
+	"row":   true,
+}
+
+func appendSplitModeArgs(params []string, opts api.Options) []string {
+	if opts.LlamaCppSplitMode == "" {
+		return params
+	}
+
+	if !validSplitModes[opts.LlamaCppSplitMode] {
+		slog.Warn("invalid split_mode value, ignoring", "split_mode", opts.LlamaCppSplitMode)
+		return params
+	}
+
+	return append(params, "--split-mode", opts.LlamaCppSplitMode)
+}
+
+func appendTensorSplitArgs(params []string, opts api.Options) []string {
+	if opts.LlamaCppTensorSplit == "" {
+		return params
+	}
+
+	// Validate that tensor_split is a comma-separated list of non-negative integers.
+	parts := strings.Split(opts.LlamaCppTensorSplit, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			slog.Warn("invalid tensor_split value (empty element), ignoring", "tensor_split", opts.LlamaCppTensorSplit)
+			return params
+		}
+		if _, err := strconv.Atoi(part); err != nil {
+			slog.Warn("invalid tensor_split value (not an integer), ignoring", "tensor_split", opts.LlamaCppTensorSplit)
+			return params
+		}
+	}
+
+	return append(params, "--tensor-split", opts.LlamaCppTensorSplit)
 }
 
 func appendMMProjArgs(params []string, launch llamaServerLaunchConfig) []string {
