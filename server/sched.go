@@ -690,6 +690,10 @@ iGPUScan:
 	totalSize, vramSize := llama.MemorySize()
 	trainContext := modelTrainContext(f)
 	if effectiveNumCtx := llama.ContextLength(); req.model.ModelPath != "" && effectiveNumCtx > 0 {
+		// Store the actual runner context size (not the client's requested num_ctx).
+		// When llamacpp_ctx_size is set, ContextLength() returns that value,
+		// ensuring runner.Options.NumCtx reflects the true runner shape for
+		// ollama ps reporting and reload comparison.
 		req.opts.NumCtx = effectiveNumCtx
 		req.contextShift = resolveContextShift(req.shift, effectiveNumCtx)
 	}
@@ -981,7 +985,12 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		return gpus, launchOpts
 	}
 
-	if opts.MainGPU != nil {
+	// When tensor splitting is configured (split_mode or tensor_split), skip single-GPU
+	// optimizations and present all available GPUs to llama.cpp so it can distribute
+	// tensors according to the manifest's split configuration.
+	tensorSplitConfigured := opts.LlamaCppTensorSplit != "" || opts.LlamaCppSplitMode != ""
+
+	if opts.MainGPU != nil && !tensorSplitConfigured {
 		gpu, available, ok := bestExplicitMainGPU(systemInfo, groups, *opts.MainGPU)
 		if !ok {
 			selected := bestGPUGroupByAvailableMemory(systemInfo, groups)
@@ -1007,7 +1016,7 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		return selected, launchOpts
 	}
 
-	if !envconfig.SchedSpread() && predictedVRAM > 0 {
+	if !envconfig.SchedSpread() && predictedVRAM > 0 && !tensorSplitConfigured {
 		gpu, available, ok := bestSingleGPUFit(systemInfo, groups, predictedVRAM)
 		if ok {
 			selected, launchOpts := singleLlamaServerGPUPlacement(gpu, launchOpts)
@@ -1416,6 +1425,14 @@ func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool 
 	if optsNew.NumGPU < 0 {
 		optsExisting.NumGPU = -1
 		optsNew.NumGPU = -1
+	}
+
+	// When llamacpp_ctx_size is set, the runner's context budget is fixed at load time.
+	// Client-level num_ctx changes should not trigger reloads since they don't affect
+	// the runner shape — just validate that the request fits within the allocated budget.
+	if optsExisting.LlamaCppCtxSize > 0 || optsNew.LlamaCppCtxSize > 0 {
+		optsExisting.NumCtx = 0
+		optsNew.NumCtx = 0
 	}
 
 	contextShift := req.contextShift
