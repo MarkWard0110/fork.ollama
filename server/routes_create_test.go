@@ -1367,6 +1367,7 @@ func TestCreateAndShowRemoteModel(t *testing.T) {
 		Families:          []string{"gptoss"},
 		ParameterSize:     "20.9B",
 		QuantizationLevel: "MXFP4",
+		ContextLength:     131072,
 	}
 
 	if !reflect.DeepEqual(resp.Details, expectedDetails) {
