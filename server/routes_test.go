@@ -815,6 +815,85 @@ func TestShow(t *testing.T) {
 	}
 }
 
+func TestShowClampsContextLengthWithLlamaCppCtxSize(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	var s Server
+
+	// Create a model with a large trained context length (131072)
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture": "test",
+		"test.context_length":  uint32(131072),
+	}, nil)
+
+	createRequest(t, s.CreateHandler, api.CreateRequest{
+		Name:  "show-clamp-model",
+		Files: map[string]string{"model.gguf": digest},
+		Parameters: map[string]any{
+			"llamacpp_ctx_size": float64(32768),
+		},
+		Info: map[string]any{
+			"context_length": float64(131072),
+		},
+	})
+
+	w := createRequest(t, s.ShowHandler, api.ShowRequest{
+		Name: "show-clamp-model",
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status code 200, actual %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.ShowResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be clamped to llamacpp_ctx_size (32768), not the trained max (131072)
+	if resp.Details.ContextLength != 32768 {
+		t.Fatalf("context length = %d, want 32768 (clamped by llamacpp_ctx_size)", resp.Details.ContextLength)
+	}
+}
+
+func TestShowNoClampWithoutLlamaCppCtxSize(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	var s Server
+
+	// Create a model with no llamacpp_ctx_size parameter
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture": "test",
+		"test.context_length":  uint32(131072),
+	}, nil)
+
+	createRequest(t, s.CreateHandler, api.CreateRequest{
+		Name:  "show-no-clamp-model",
+		Files: map[string]string{"model.gguf": digest},
+		Info: map[string]any{
+			"context_length": float64(131072),
+		},
+	})
+
+	w := createRequest(t, s.ShowHandler, api.ShowRequest{
+		Name: "show-no-clamp-model",
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status code 200, actual %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp api.ShowResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should report full trained context length when no llamacpp_ctx_size is set
+	if resp.Details.ContextLength != 131072 {
+		t.Fatalf("context length = %d, want 131072 (no clamp)", resp.Details.ContextLength)
+	}
+}
+
 func TestShowTemplateUsesSelectedRuntimeTemplate(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
 	t.Setenv("OLLAMA_GO_TEMPLATE", "")

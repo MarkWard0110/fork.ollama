@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ollama/ollama/llm"
@@ -118,6 +119,112 @@ func TestModelOptionsNumCtxPriority(t *testing.T) {
 			}
 
 			opts, err := s.modelOptions(model, requestOpts)
+			if err != nil {
+				t.Fatalf("modelOptions failed: %v", err)
+			}
+
+			if opts.NumCtx != tt.expectedNumCtx {
+				t.Errorf("NumCtx = %d, want %d", opts.NumCtx, tt.expectedNumCtx)
+			}
+		})
+	}
+}
+
+func TestModelOptionsLlamaCppCtxSizeClamp(t *testing.T) {
+	tests := []struct {
+		name             string
+		defaultNumCtx    int // VRAM-based default
+		modelNumCtx      int // 0 means not set in model
+		llamacppCtxSize  int // 0 means not set in model
+		requestNumCtx    int // 0 means not set in request
+		expectedNumCtx   int
+		expectedErrorSub string // non-empty means an error is expected containing this substring
+	}{
+		{
+			name:             "default num_ctx silently capped by llamacpp_ctx_size",
+			defaultNumCtx:    32768,
+			modelNumCtx:      0,
+			llamacppCtxSize:  8192,
+			requestNumCtx:    0,
+			expectedNumCtx:   8192,
+			expectedErrorSub: "",
+		},
+		{
+			name:             "model num_ctx silently capped by llamacpp_ctx_size",
+			defaultNumCtx:    32768,
+			modelNumCtx:      16384,
+			llamacppCtxSize:  8192,
+			requestNumCtx:    0,
+			expectedNumCtx:   8192,
+			expectedErrorSub: "",
+		},
+		{
+			name:             "explicit request num_ctx rejected when exceeding llamacpp_ctx_size",
+			defaultNumCtx:    32768,
+			modelNumCtx:      0,
+			llamacppCtxSize:  8192,
+			requestNumCtx:    32768,
+			expectedNumCtx:   0,
+			expectedErrorSub: "exceeds model's llamacpp_ctx_size",
+		},
+		{
+			name:             "explicit request num_ctx within llamacpp_ctx_size accepted",
+			defaultNumCtx:    32768,
+			modelNumCtx:      0,
+			llamacppCtxSize:  8192,
+			requestNumCtx:    4096,
+			expectedNumCtx:   4096,
+			expectedErrorSub: "",
+		},
+		{
+			name:             "no clamp when num_ctx equals llamacpp_ctx_size",
+			defaultNumCtx:    32768,
+			modelNumCtx:      0,
+			llamacppCtxSize:  16384,
+			requestNumCtx:    16384,
+			expectedNumCtx:   16384,
+			expectedErrorSub: "",
+		},
+		{
+			name:             "no clamp when llamacpp_ctx_size larger than num_ctx",
+			defaultNumCtx:    32768,
+			modelNumCtx:      0,
+			llamacppCtxSize:  65536,
+			requestNumCtx:    0,
+			expectedNumCtx:   32768,
+			expectedErrorSub: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &Server{
+				defaultNumCtx: tt.defaultNumCtx,
+			}
+
+			// Build model options
+			modelOpts := map[string]any{"llamacpp_ctx_size": float64(tt.llamacppCtxSize)}
+			if tt.modelNumCtx != 0 {
+				modelOpts["num_ctx"] = float64(tt.modelNumCtx)
+			}
+			m := &Model{Options: modelOpts}
+
+			// Build request options
+			var requestOpts map[string]any
+			if tt.requestNumCtx != 0 {
+				requestOpts = map[string]any{"num_ctx": float64(tt.requestNumCtx)}
+			}
+
+			opts, err := s.modelOptions(m, requestOpts)
+			if tt.expectedErrorSub != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.expectedErrorSub)
+				}
+				if !strings.Contains(err.Error(), tt.expectedErrorSub) {
+					t.Fatalf("error = %q, want substring %q", err.Error(), tt.expectedErrorSub)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("modelOptions failed: %v", err)
 			}
