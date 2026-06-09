@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"slices"
 	"testing"
@@ -164,4 +165,81 @@ func createListedModelFromKV(t *testing.T, name string, kv map[string]any, tmpl 
 	t.Helper()
 	_, digest := createBinFile(t, kv, nil)
 	createModelFromBlob(t, name, digest, tmpl)
+}
+
+func TestListModelsClampsContextLengthWithLlamaCppCtxSize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with a large trained context length (131072)
+	_, digest := createBinFile(t, map[string]any{
+		"test.context_length": uint32(131072),
+	}, nil)
+
+	var s Server
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "list-clamp",
+		Files:  map[string]string{"model.gguf": digest},
+		Stream: &stream,
+		Parameters: map[string]any{
+			"llamacpp_ctx_size": float64(32768),
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create model status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	got := listedModel(t, "list-clamp:latest")
+
+	// Should be clamped to llamacpp_ctx_size (32768), not the trained max (131072)
+	if got.Details.ContextLength != 32768 {
+		t.Fatalf("context length = %d, want 32768 (clamped by llamacpp_ctx_size)", got.Details.ContextLength)
+	}
+}
+
+func TestListModelsNoClampWithoutLlamaCppCtxSize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with no llamacpp_ctx_size parameter
+	createListedModelFromKV(t, "list-no-clamp", map[string]any{
+		"test.context_length": uint32(131072),
+	}, "")
+
+	got := listedModel(t, "list-no-clamp:latest")
+
+	// Should report full trained context length when no llamacpp_ctx_size is set
+	if got.Details.ContextLength != 131072 {
+		t.Fatalf("context length = %d, want 131072 (no clamp)", got.Details.ContextLength)
+	}
+}
+
+func TestListModelsClampHigherThanTrainedNoEffect(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	setTestHome(t, t.TempDir())
+
+	// Create a model with trained context 4096 and llamacpp_ctx_size higher (8192)
+	_, digest := createBinFile(t, map[string]any{
+		"test.context_length": uint32(4096),
+	}, nil)
+
+	var s Server
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "list-clamp-high",
+		Files:  map[string]string{"model.gguf": digest},
+		Stream: &stream,
+		Parameters: map[string]any{
+			"llamacpp_ctx_size": float64(8192),
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("create model status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	got := listedModel(t, "list-clamp-high:latest")
+
+	// Trained max (4096) takes precedence when llamacpp_ctx_size is higher
+	if got.Details.ContextLength != 4096 {
+		t.Fatalf("context length = %d, want 4096 (trained max)", got.Details.ContextLength)
+	}
 }
