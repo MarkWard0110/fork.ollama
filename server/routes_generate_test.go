@@ -126,12 +126,19 @@ func TestOptionsForPromptUsesEffectiveContextLength(t *testing.T) {
 	}
 }
 
-func TestOptionsForPromptLeavesLargerRunnerContext(t *testing.T) {
-	opts := &api.Options{Runner: api.Runner{NumCtx: 2048}}
+func TestOptionsForPromptUsesRunnerContextLengthWhenLarger(t *testing.T) {
+	opts := &api.Options{Runner: api.Runner{NumCtx: 100000}}
 
-	got := optionsForPrompt(opts, &mockRunner{contextLength: 4096})
-	if got != opts {
-		t.Fatal("expected original options when runner context is larger")
+	// Runner has llamacpp_ctx_size of 164000, client requested num_ctx of 100000
+	got := optionsForPrompt(opts, &mockRunner{contextLength: 164000})
+	if got == opts {
+		t.Fatal("expected copied options")
+	}
+	if got.NumCtx != 164000 {
+		t.Fatalf("NumCtx = %d, want 164000 (runner's context length)", got.NumCtx)
+	}
+	if opts.NumCtx != 100000 {
+		t.Fatalf("original NumCtx mutated to %d", opts.NumCtx)
 	}
 }
 

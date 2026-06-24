@@ -737,16 +737,12 @@ func TestLlamaServerCompletionContextShiftTruncatesPromptOverContext(t *testing.
 	}
 }
 
-func TestLlamaServerCompletionContextShiftAvoidsOneTokenHeadroomRegression(t *testing.T) {
+func TestLlamaServerCompletionPromptUsesRunnerContextLengthWithLlamaCppCtxSize(t *testing.T) {
 	var capturedReq llamaServerCompletionRequest
 	var tokenizeReq struct {
 		Content      string `json:"content"`
 		AddSpecial   bool   `json:"add_special"`
 		ParseSpecial *bool  `json:"parse_special"`
-	}
-	tokens := make([]int, 5000)
-	for i := range tokens {
-		tokens[i] = i
 	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -758,16 +754,15 @@ func TestLlamaServerCompletionContextShiftAvoidsOneTokenHeadroomRegression(t *te
 				t.Errorf("invalid tokenize request body: %v", err)
 				return
 			}
-			if err := json.NewEncoder(w).Encode(map[string][]int{"tokens": tokens}); err != nil {
-				t.Errorf("failed to encode tokenize response: %v", err)
-			}
+			// Return 10 tokens — between NumCtx (5) and LlamaCppCtxSize (20)
+			fmt.Fprint(w, `{"tokens":[0,1,2,3,4,5,6,7,8,9]}`)
 		case "/completion":
 			if err := json.NewDecoder(r.Body).Decode(&capturedReq); err != nil {
 				t.Errorf("invalid completion request body: %v", err)
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintln(w, `data: {"content":"ok","stop":true,"timings":{"prompt_n":2051,"prompt_ms":1,"predicted_n":32,"predicted_ms":1}}`)
+			fmt.Fprintln(w, `data: {"content":"ok","stop":true,"timings":{"prompt_n":10,"prompt_ms":1,"predicted_n":1,"predicted_ms":1}}`)
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
@@ -778,24 +773,23 @@ func TestLlamaServerCompletionContextShiftAvoidsOneTokenHeadroomRegression(t *te
 	var portInt int
 	fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
 
+	// Runner with LlamaCppCtxSize=20 but NumCtx=5
+	// Prompt tokenizes to 10 tokens — should NOT be truncated since 10 < 20 (LlamaCppCtxSize)
+	// With the bug, it would be truncated since 10 > 5 (NumCtx)
 	runner := &llamaServerRunner{
 		port:    portInt,
 		cmd:     fakeRunningCmd(),
 		sem:     semaphore.NewWeighted(1),
-		options: api.Options{Runner: api.Runner{NumCtx: 4096}},
-		ggml: loadTestGGML(t, ggml.KV{
-			"general.architecture":         "gemma3",
-			"tokenizer.ggml.add_bos_token": true,
-		}),
+		options: api.Options{Runner: api.Runner{NumCtx: 5, LlamaCppCtxSize: 20}},
 		launch: llamaServerLaunchConfig{
 			config: LlamaServerConfig{ContextShift: true},
 		},
 	}
 
 	opts := api.DefaultOptions()
-	opts.NumKeep = 4
+	prompt := strings.Repeat("long prompt ", 2)
 	err := runner.Completion(t.Context(), CompletionRequest{
-		Prompt:   strings.Repeat("long prompt ", 500),
+		Prompt:   prompt,
 		Options:  &opts,
 		Truncate: true,
 	}, func(cr CompletionResponse) {})
@@ -803,30 +797,12 @@ func TestLlamaServerCompletionContextShiftAvoidsOneTokenHeadroomRegression(t *te
 		t.Fatalf("Completion error: %v", err)
 	}
 
-	got, ok := capturedReq.Prompt.([]any)
-	if !ok {
-		t.Fatalf("completion prompt = %T, want token array", capturedReq.Prompt)
-	}
-
-	if len(got) != 2051 {
-		t.Fatalf("token prompt len = %d, want 2051", len(got))
-	}
-	if len(got) == 4095 {
-		t.Fatal("token prompt preserved old one-token headroom behavior")
-	}
-
-	effectiveKeep := opts.NumKeep + 1
-	for i := range effectiveKeep {
-		gotToken, ok := got[i].(float64)
-		if !ok || int(gotToken) != i {
-			t.Fatalf("token prompt[%d] = %#v, want %d", i, got[i], i)
-		}
-	}
-
-	const wantSuffixStart = 2954
-	gotToken, ok := got[effectiveKeep].(float64)
-	if !ok || int(gotToken) != wantSuffixStart {
-		t.Fatalf("first shifted token = %#v, want %d", got[effectiveKeep], wantSuffixStart)
+	// The prompt should be sent as a string (not truncated token array)
+	// because 10 tokens fits within LlamaCppCtxSize of 20
+	if str, ok := capturedReq.Prompt.(string); !ok {
+		t.Fatalf("completion prompt = %T, want string (no truncation needed since token count < LlamaCppCtxSize)", capturedReq.Prompt)
+	} else if str != prompt {
+		t.Fatalf("completion prompt = %q, want %q", str, prompt)
 	}
 }
 
