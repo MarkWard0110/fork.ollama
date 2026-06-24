@@ -2399,7 +2399,7 @@ func optionsForPrompt(opts *api.Options, runner llm.LlamaServer) *api.Options {
 		return opts
 	}
 
-	if ctxLen := runner.ContextLength(); ctxLen > 0 && opts.NumCtx > ctxLen {
+	if ctxLen := runner.ContextLength(); ctxLen > 0 {
 		copied := *opts
 		copied.NumCtx = ctxLen
 		return &copied

@@ -267,7 +267,7 @@ func (s *llamaServerRunner) tokenizerAddsBOS() bool {
 
 func (s *llamaServerRunner) completionPromptForRequest(ctx context.Context, req CompletionRequest) (any, error) {
 	prompt := s.completionPrompt(req.Prompt, req.LeadingBOS)
-	if !req.Truncate || len(req.Media) > 0 || s.options.NumCtx <= 1 || len(prompt) < s.options.NumCtx {
+	if !req.Truncate || len(req.Media) > 0 || s.ContextLength() <= 1 || len(prompt) < s.ContextLength() {
 		return prompt, nil
 	}
 
@@ -276,8 +276,8 @@ func (s *llamaServerRunner) completionPromptForRequest(ctx context.Context, req 
 		return nil, err
 	}
 
-	fullPromptLimit := s.options.NumCtx - 1
-	if len(tokens) <= fullPromptLimit {
+	limit := s.ContextLength() - 1
+	if len(tokens) <= limit {
 		return prompt, nil
 	}
 
