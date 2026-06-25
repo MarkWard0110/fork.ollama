@@ -1658,7 +1658,7 @@ func TestShowClampsContextLengthWithLlamaCppCtxSize(t *testing.T) {
 	var s Server
 
 	// Create a model with a large trained context length (131072)
-	_, digest := createBinFile(t, ggml.KV{
+	_, digest := createBinFile(t, gguftest.KV{
 		"general.architecture": "test",
 		"test.context_length":  uint32(131072),
 	}, nil)
@@ -1699,7 +1699,7 @@ func TestShowNoClampWithoutLlamaCppCtxSize(t *testing.T) {
 	var s Server
 
 	// Create a model with no llamacpp_ctx_size parameter
-	_, digest := createBinFile(t, ggml.KV{
+	_, digest := createBinFile(t, gguftest.KV{
 		"general.architecture": "test",
 		"test.context_length":  uint32(131072),
 	}, nil)
