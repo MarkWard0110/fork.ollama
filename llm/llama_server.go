@@ -303,9 +303,7 @@ func (s *llamaServerRunner) completionPromptForRequest(ctx context.Context, req 
 	if s.tokenizerAddsBOS() {
 		nKeep++
 	}
-	nKeep = min(nKeep, fullPromptLimit)
-
-	limit := contextShiftPromptLimit(s.options.NumCtx, nKeep)
+	limit = contextShiftPromptLimit(s.ContextLength(), nKeep)
 	discard := len(tokens) - limit
 	truncated := make([]int, 0, limit)
 	truncated = append(truncated, tokens[:nKeep]...)
