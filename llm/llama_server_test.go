@@ -3595,6 +3595,50 @@ func TestMemoryParsingWriterMemorySizeMmapPartialOffload(t *testing.T) {
 	}
 }
 
+func TestPredictServerVRAMHybridFullAttentionInterval(t *testing.T) {
+	const (
+		numCtx  = 131072
+		blocks  = 33
+		kvHeads = 4
+		embd    = 4096
+		heads   = 16
+	)
+	kvBase := gguftest.KV{
+		"general.architecture":         "qwen35",
+		"qwen35.block_count":           uint32(blocks),
+		"qwen35.embedding_length":      uint32(embd),
+		"qwen35.attention.head_count":  uint32(heads),
+		"qwen35.attention.head_count_kv": uint32(kvHeads),
+	}
+
+	// The test file is empty, so the weights term is the file size itself;
+	// the KV term is what we're asserting on.
+	kvTerm := func(layers uint64) uint64 {
+		return 2 * layers * uint64(kvHeads) * (embd / heads) * uint64(numCtx) * 2
+	}
+
+	// Dense model: every block keeps a per-token KV cache.
+	densePath, dense := writeTestGGUF(t, kvBase, nil)
+	wantDense := dense.FileSize() + kvTerm(blocks)
+	if got := PredictServerVRAM(densePath, dense, numCtx); got != wantDense {
+		t.Fatalf("dense prediction = %d, want %d", got, wantDense)
+	}
+
+	// Hybrid model: KV caches only on every 4th block (full_attention_interval).
+	// The old estimate counted all 33 blocks and over-predicted by ~4x, which
+	// is what forced single-GPU-fitting hybrids onto multi-GPU splits.
+	kvHybrid := gguftest.KV{}
+	for k, v := range kvBase {
+		kvHybrid[k] = v
+	}
+	kvHybrid["qwen35.full_attention_interval"] = uint32(4)
+	hybridPath, hybrid := writeTestGGUF(t, kvHybrid, nil)
+	wantHybrid := hybrid.FileSize() + kvTerm(9)
+	if got := PredictServerVRAM(hybridPath, hybrid, numCtx); got != wantHybrid {
+		t.Fatalf("hybrid prediction = %d, want %d", got, wantHybrid)
+	}
+}
+
 func TestVRAMByGPU(t *testing.T) {
 	runner := &llamaServerRunner{
 		vramByDevice: map[string]uint64{

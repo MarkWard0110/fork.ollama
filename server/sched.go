@@ -1020,12 +1020,7 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		return gpus, launchOpts
 	}
 
-	// When tensor splitting is configured (split_mode or tensor_split), skip single-GPU
-	// optimizations and present all available GPUs to llama.cpp so it can distribute
-	// tensors according to the manifest's split configuration.
-	tensorSplitConfigured := opts.LlamaCppTensorSplit != "" || opts.LlamaCppSplitMode != ""
-
-	if opts.MainGPU != nil && !tensorSplitConfigured {
+	if opts.MainGPU != nil {
 		gpu, available, ok := bestExplicitMainGPU(systemInfo, groups, *opts.MainGPU)
 		if !ok {
 			selected := bestGPUGroupByAvailableMemory(systemInfo, groups)
@@ -1051,7 +1046,7 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		return selected, launchOpts
 	}
 
-	if !envconfig.SchedSpread() && predictedVRAM > 0 && !tensorSplitConfigured {
+	if !envconfig.SchedSpread() && predictedVRAM > 0 {
 		gpu, available, ok := bestSingleGPUFit(systemInfo, groups, predictedVRAM)
 		if ok {
 			selected, launchOpts := singleLlamaServerGPUPlacement(gpu, launchOpts)
