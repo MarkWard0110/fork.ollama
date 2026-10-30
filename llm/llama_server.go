@@ -2904,6 +2904,15 @@ func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
 
 	// KV cache: 2 (K+V) * layers * kv_heads * head_dim * context * 2 bytes (f16)
 	layers := f.KV().BlockCount()
+	// Hybrid SSM/attention models (e.g. qwen35) only keep per-token KV caches on
+	// every Nth layer; the rest use fixed-size recurrent state independent of
+	// context length. Counting all layers inflates the estimate and can push
+	// placement off a single GPU that would actually fit the model.
+	if kv := f.KV().KeyValue("full_attention_interval"); kv.Valid() {
+		if n := kv.Uint(); n > 1 {
+			layers = (layers + n - 1) / n
+		}
+	}
 	kvHeads := f.KV().HeadCountKVMin()
 	if kvHeads == 0 {
 		kvHeads = 1
