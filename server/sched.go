@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -592,7 +593,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			if requireFull && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(loadGpus) > 0 {
 				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 				// Use 80% of free memory as threshold to leave headroom.
-				if predictedForLoad > freeMemory*80/100 {
+				if predictedForLoad > freeMemory*80/100 || !tensorSplitFits(systemInfo, loadGpus, launchOpts, predictedForLoad) {
 					slog.Info("llama-server model predicted to exceed available memory, evicting",
 						"predicted", format.HumanBytes2(predictedForLoad),
 						"predicted_num_ctx", predictedCtx,
@@ -999,6 +1000,36 @@ func availableMemoryForPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo,
 	}
 
 	return availableMemoryForLoad(systemInfo, placementGpus)
+}
+
+// tensorSplitFits checks each device as well as the aggregate capacity. A
+// configured split can overload one GPU even when the group has ample VRAM.
+// The split is only an approximation of layer allocation, so retain the same
+// headroom used by the aggregate preflight.
+func tensorSplitFits(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, opts api.Options, predicted uint64) bool {
+	if opts.LlamaCppTensorSplit == "" || len(gpus) < 2 || opts.MainGPU != nil {
+		return true
+	}
+	parts := strings.Split(opts.LlamaCppTensorSplit, ",")
+	weights := make([]float64, len(gpus))
+	var total float64
+	for i, part := range parts {
+		value, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+		if err != nil || i >= len(gpus) {
+			return true // Let llama-server handle invalid configurations.
+		}
+		weights[i] = float64(value)
+		total += weights[i]
+	}
+	if total == 0 {
+		return true // llama.cpp chooses its own split when all weights are zero.
+	}
+	for i, gpu := range gpus {
+		if float64(predicted)*weights[i]/total > float64(availableMemoryForGPU(systemInfo, gpu))*0.8 {
+			return false
+		}
+	}
+	return true
 }
 
 func gpusForPlacement(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceInfo {

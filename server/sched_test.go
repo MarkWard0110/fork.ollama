@@ -1531,6 +1531,31 @@ func TestAvailableMemoryForLoadUsesWorstSharedMemoryMeasurement(t *testing.T) {
 	}
 }
 
+func TestTensorSplitFits(t *testing.T) {
+	gpus := []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 19 * format.GigaByte},
+		{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 23 * format.GigaByte},
+	}
+	for _, tt := range []struct {
+		name      string
+		split     string
+		predicted uint64
+		want      bool
+	}{
+		{"imbalanced split exceeds first GPU", "8,1", 30 * format.GigaByte, false},
+		{"balanced split fits both", "1,1", 30 * format.GigaByte, true},
+		{"small model fits imbalanced split", "8,1", 10 * format.GigaByte, true},
+		{"automatic split", "0,0", 30 * format.GigaByte, true},
+		{"invalid split", "bad,1", 30 * format.GigaByte, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := api.DefaultOptions()
+			opts.LlamaCppTensorSplit = tt.split
+			require.Equal(t, tt.want, tensorSplitFits(ml.SystemInfo{}, gpus, opts, tt.predicted))
+		})
+	}
+}
+
 func TestSelectLlamaServerPlacement(t *testing.T) {
 	systemInfo := ml.SystemInfo{FreeMemory: 14 * format.GigaByte}
 
