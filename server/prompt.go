@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/llm"
@@ -33,6 +34,9 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 	currMsgIdx := 0
 
 	if truncate {
+		start := time.Now()
+		var renderDuration, tokenizeDuration time.Duration
+		attempts := 0
 		// Start with all messages and remove from the front until it fits in context
 		for i := 0; i <= lastMsgIdx; i++ {
 			// Collect system messages from the portion we're about to skip
@@ -43,12 +47,17 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 				}
 			}
 
+			attempts++
+			phaseStart := time.Now()
 			p, err := renderPrompt(m, append(system, msgs[i:]...), tools, think)
+			renderDuration += time.Since(phaseStart)
 			if err != nil {
 				return "", nil, err
 			}
 
+			phaseStart = time.Now()
 			s, err := tokenize(ctx, p)
+			tokenizeDuration += time.Since(phaseStart)
 			if err != nil {
 				return "", nil, err
 			}
@@ -71,10 +80,12 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 				break
 			}
 		}
+		removed := currMsgIdx - len(system)
+		slog.Debug("chat prompt truncation timing", "duration", time.Since(start), "render_duration", renderDuration, "tokenize_duration", tokenizeDuration, "attempts", attempts, "input_messages", len(msgs), "removed_messages", removed, "retained_messages", len(msgs)-removed)
 	}
 
 	if currMsgIdx > 0 {
-		slog.Debug("truncating input messages which exceed context length", "truncated", len(msgs[currMsgIdx:]))
+		slog.Debug("truncating input messages which exceed context length", "removed", currMsgIdx-len(system), "retained", len(msgs)-currMsgIdx+len(system))
 	}
 
 	renderMsgs, media, err := imageTaggedMessages(m, msgs, currMsgIdx, false)

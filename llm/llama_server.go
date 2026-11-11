@@ -2723,6 +2723,7 @@ func isEmbeddingInputLimitError(errMsg string) bool {
 }
 
 func (s *llamaServerRunner) tokenize(ctx context.Context, content any, addSpecial bool) ([]int, error) {
+	start := time.Now()
 	req := struct {
 		Content    any  `json:"content"`
 		AddSpecial bool `json:"add_special,omitempty"`
@@ -2742,13 +2743,17 @@ func (s *llamaServerRunner) tokenize(ctx context.Context, content any, addSpecia
 	}
 	r.Header.Set("Content-Type", "application/json")
 
+	requestStart := time.Now()
 	resp, err := s.httpClient().Do(r)
+	requestDuration := time.Since(requestStart)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	readStart := time.Now()
 	body, err := io.ReadAll(resp.Body)
+	readDuration := time.Since(readStart)
 	if err != nil {
 		return nil, err
 	}
@@ -2760,9 +2765,11 @@ func (s *llamaServerRunner) tokenize(ctx context.Context, content any, addSpecia
 	var result struct {
 		Tokens []int `json:"tokens"`
 	}
+	decodeStart := time.Now()
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
 	}
+	slog.Debug("llama-server tokenization timing", "duration", time.Since(start), "request_duration", requestDuration, "read_duration", readDuration, "decode_duration", time.Since(decodeStart), "response_bytes", len(body), "tokens", len(result.Tokens))
 
 	return result.Tokens, nil
 }

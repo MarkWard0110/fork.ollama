@@ -3602,6 +3602,9 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 	lastMsgIdx := len(req.Messages) - 1
 	currMsgIdx := 0
 	var system []api.Message
+	start := time.Now()
+	var renderDuration, tokenizeDuration time.Duration
+	attempts := 0
 
 	for i := 0; i <= lastMsgIdx; i++ {
 		system = system[:0]
@@ -3613,12 +3616,17 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 
 		renderReq := req
 		renderReq.Messages = append(slices.Clone(system), req.Messages[i:]...)
+		attempts++
+		phaseStart := time.Now()
 		prompt, err := r.ApplyChatTemplate(ctx, renderReq)
+		renderDuration += time.Since(phaseStart)
 		if err != nil {
 			return nil, err
 		}
 
+		phaseStart = time.Now()
 		tokens, err := r.Tokenize(ctx, prompt)
+		tokenizeDuration += time.Since(phaseStart)
 		if err != nil {
 			return nil, err
 		}
@@ -3639,9 +3647,11 @@ func truncateNativeChatMessages(ctx context.Context, m *Model, r llm.LlamaServer
 			break
 		}
 	}
+	removed := currMsgIdx - len(system)
+	slog.Debug("native chat prompt truncation timing", "duration", time.Since(start), "render_duration", renderDuration, "tokenize_duration", tokenizeDuration, "attempts", attempts, "input_messages", len(req.Messages), "removed_messages", removed, "retained_messages", len(req.Messages)-removed)
 
 	if currMsgIdx > 0 {
-		slog.Debug("truncating native chat messages which exceed context length", "truncated", currMsgIdx)
+		slog.Debug("truncating native chat messages which exceed context length", "removed", removed, "retained", len(req.Messages)-removed)
 	}
 
 	system = system[:0]
