@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1305,6 +1306,7 @@ func TestSchedLlamaServerEvictsWhenVRAMInsufficient(t *testing.T) {
 	s.loaded["existing-model"] = &runnerRef{
 		llama:    &mockLlm{modelPath: "existing"},
 		modelKey: "existing-model",
+		gpus:     []ml.DeviceID{{Library: "Metal"}},
 	}
 	s.loadedMu.Unlock()
 
@@ -1417,6 +1419,7 @@ func TestSchedLlamaServerPredictionUsesTotalParallelContext(t *testing.T) {
 	s.loaded["existing-model"] = &runnerRef{
 		llama:    &mockLlm{modelPath: "existing"},
 		modelKey: "existing-model",
+		gpus:     []ml.DeviceID{{Library: "Metal"}},
 	}
 	s.loadedMu.Unlock()
 
@@ -1531,31 +1534,6 @@ func TestAvailableMemoryForLoadUsesWorstSharedMemoryMeasurement(t *testing.T) {
 	}
 }
 
-func TestTensorSplitFits(t *testing.T) {
-	gpus := []ml.DeviceInfo{
-		{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 19 * format.GigaByte},
-		{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 23 * format.GigaByte},
-	}
-	for _, tt := range []struct {
-		name      string
-		split     string
-		predicted uint64
-		want      bool
-	}{
-		{"imbalanced split exceeds first GPU", "8,1", 30 * format.GigaByte, false},
-		{"balanced split fits both", "1,1", 30 * format.GigaByte, true},
-		{"small model fits imbalanced split", "8,1", 10 * format.GigaByte, true},
-		{"automatic split", "0,0", 30 * format.GigaByte, true},
-		{"invalid split", "bad,1", 30 * format.GigaByte, true},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			opts := api.DefaultOptions()
-			opts.LlamaCppTensorSplit = tt.split
-			require.Equal(t, tt.want, tensorSplitFits(ml.SystemInfo{}, gpus, opts, tt.predicted))
-		})
-	}
-}
-
 func TestSelectLlamaServerPlacement(t *testing.T) {
 	systemInfo := ml.SystemInfo{FreeMemory: 14 * format.GigaByte}
 
@@ -1582,6 +1560,24 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 			wantMainGPU:      testIntPtr(0),
 			wantSelectedGPUs: 1,
 			wantGPUID:        "1",
+		},
+		{
+			name:          "single GPU fits above the former eighty percent threshold",
+			predictedVRAM: 27 * format.GibiByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 32 * format.GibiByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 24 * format.GibiByte},
+			},
+			opts: api.DefaultOptions(), wantLibrary: "CUDA", wantMainGPU: testIntPtr(0), wantSelectedGPUs: 1, wantGPUID: "0",
+		},
+		{
+			name:          "reserves one GiB even below the former percentage threshold",
+			predictedVRAM: 7 * format.GibiByte / 10,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, FreeMemory: format.GibiByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, FreeMemory: format.GibiByte},
+			},
+			opts: api.DefaultOptions(), wantLibrary: "ROCm", wantSelectedGPUs: 2,
 		},
 		{
 			name:          "explicit main gpu selects matching backend group",
@@ -1669,6 +1665,138 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExplicitSplitRetainsGPUGroup(t *testing.T) {
+	gpus := []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{ID: "0", Library: "ROCm"}, FreeMemory: 32 * format.GibiByte},
+		{DeviceID: ml.DeviceID{ID: "1", Library: "ROCm"}, FreeMemory: 24 * format.GibiByte},
+	}
+	for _, opts := range []api.Options{
+		{Runner: api.Runner{NumGPU: -1, LlamaCppTensorSplit: "2,1"}},
+		{Runner: api.Runner{NumGPU: -1, LlamaCppSplitMode: "layer", MainGPU: testIntPtr(1)}},
+	} {
+		selected, got := selectLlamaServerPlacement(ml.SystemInfo{}, gpus, format.GibiByte, opts)
+		require.Len(t, selected, 2)
+		require.Equal(t, opts.MainGPU, got.MainGPU)
+		require.Equal(t, opts.LlamaCppTensorSplit, got.LlamaCppTensorSplit)
+		require.Equal(t, opts.LlamaCppSplitMode, got.LlamaCppSplitMode)
+	}
+}
+
+func TestEffectiveLlamaServerContextOverride(t *testing.T) {
+	opts := api.Options{Runner: api.Runner{NumCtx: 4096, LlamaCppCtxSize: 32768}}
+	require.Equal(t, 65536, effectiveLlamaServerContext(opts, nil, 2))
+}
+
+func TestSingleGPUHeadroomAcrossBackends(t *testing.T) {
+	for _, library := range []string{"CUDA", "ROCm"} {
+		gpus := []ml.DeviceInfo{
+			{DeviceID: ml.DeviceID{ID: "0", Library: library}, FreeMemory: 32 * format.GibiByte},
+			{DeviceID: ml.DeviceID{ID: "1", Library: library}, FreeMemory: 24 * format.GibiByte},
+		}
+		gpu, ok := bestSingleGPUWithHeadroom(ml.SystemInfo{}, ml.ByLibrary(gpus), 27*format.GibiByte)
+		require.True(t, ok)
+		require.Equal(t, "0", gpu.ID)
+		_, ok = bestSingleGPUWithHeadroom(ml.SystemInfo{}, ml.ByLibrary(gpus), 32*format.GibiByte)
+		require.False(t, ok)
+	}
+}
+
+func TestPlacementCapacityUsesSameHeadroom(t *testing.T) {
+	gpu := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 20 * format.GibiByte}
+	require.True(t, placementHasCapacity(ml.SystemInfo{}, []ml.DeviceInfo{gpu}, 17*format.GibiByte))
+	require.False(t, placementHasCapacity(ml.SystemInfo{}, []ml.DeviceInfo{gpu}, 20*format.GibiByte))
+	shared := gpu
+	shared.Integrated = true
+	require.False(t, placementHasCapacity(ml.SystemInfo{FreeMemory: 10 * format.GibiByte}, []ml.DeviceInfo{shared}, 17*format.GibiByte))
+}
+
+func TestLoadFitsOnOtherGPUWithoutEviction(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := InitScheduler(ctx)
+	first := ml.DeviceID{ID: "0", Library: "CUDA"}
+	second := ml.DeviceID{ID: "1", Library: "CUDA"}
+	s.loaded["resident"] = &runnerRef{modelKey: "resident", gpus: []ml.DeviceID{first}, llama: &mockLlm{}}
+	scenario := newScenarioRequest(t, ctx, "next", 0, nil, nil)
+	var selected []ml.DeviceInfo
+	s.newServerFn = func(_ ml.SystemInfo, gpus []ml.DeviceInfo, model string, _ *gguf.Model, _, _ []string, _ api.Options, _ int, _ llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		selected = gpus
+		return &mockLlm{modelPath: model}, nil
+	}
+	gpus := []ml.DeviceInfo{{DeviceID: first, FreeMemory: format.GibiByte}, {DeviceID: second, FreeMemory: 20 * format.GibiByte}}
+	require.False(t, s.load(scenario.req, ml.SystemInfo{}, gpus, true))
+	require.Len(t, selected, 1)
+	require.Equal(t, second, selected[0].DeviceID)
+	require.Contains(t, s.loaded, "resident")
+}
+
+func TestEvictionTargetsRelevantGPU(t *testing.T) {
+	s := InitScheduler(t.Context())
+	first := ml.DeviceID{ID: "0", Library: "CUDA"}
+	second := ml.DeviceID{ID: "1", Library: "CUDA"}
+	unrelated := &runnerRef{modelPath: "a", gpus: []ml.DeviceID{first}, llama: &mockLlm{}}
+	active := &runnerRef{modelPath: "b", gpus: []ml.DeviceID{second}, refCount: 1, llama: &mockLlm{}}
+	idle := &runnerRef{modelPath: "c", gpus: []ml.DeviceID{second}, llama: &mockLlm{}}
+	s.loaded["a"] = unrelated
+	s.loaded["b"] = active
+	s.loaded["c"] = idle
+	require.Same(t, idle, s.findRunnerToUnloadOnGPUs([]ml.DeviceID{second}))
+	delete(s.loaded, "c")
+	require.Same(t, active, s.findRunnerToUnloadOnGPUs([]ml.DeviceID{second}))
+	require.Nil(t, s.findRunnerToUnloadOnGPUs([]ml.DeviceID{{ID: "2", Library: "CUDA"}}))
+}
+
+func TestExplicitSplitDeviceTargets(t *testing.T) {
+	gpus := []ml.DeviceInfo{{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}}, {DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}}}
+	opts := api.Options{Runner: api.Runner{LlamaCppTensorSplit: "0,1"}}
+	require.Equal(t, []ml.DeviceID{gpus[1].DeviceID}, placementDeviceIDs(gpus, opts))
+	opts.LlamaCppTensorSplit = "0,0"
+	require.Equal(t, []ml.DeviceID{gpus[0].DeviceID, gpus[1].DeviceID}, placementDeviceIDs(gpus, opts))
+}
+
+func TestExplicitSplitOOMIdentifiesLikelyShortfall(t *testing.T) {
+	gpus := []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 25 * format.GibiByte},
+		{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 5 * format.GibiByte},
+	}
+	opts := api.Options{Runner: api.Runner{LlamaCppTensorSplit: "1,1"}}
+	require.Equal(t, []ml.DeviceID{gpus[1].DeviceID}, likelySplitShortfallDevices(ml.SystemInfo{}, gpus, opts, 20*format.GibiByte))
+}
+
+func TestExplicitSplitOOMTargetsRelevantModelAndKeepsOptions(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := InitScheduler(ctx)
+	first := ml.DeviceID{ID: "0", Library: "CUDA"}
+	second := ml.DeviceID{ID: "1", Library: "CUDA"}
+	other := ml.DeviceID{ID: "0", Library: "ROCm"}
+	resident := &runnerRef{modelKey: "resident", gpus: []ml.DeviceID{second}, llama: &mockLlm{}}
+	unrelated := &runnerRef{modelKey: "unrelated", gpus: []ml.DeviceID{other}, llama: &mockLlm{}}
+	s.loaded["resident"] = resident
+	s.loaded["unrelated"] = unrelated
+	scenario := newScenarioRequest(t, ctx, "split", 0, nil, nil)
+	scenario.req.opts.LlamaCppTensorSplit = "1,1"
+	scenario.req.opts.LlamaCppSplitMode = "layer"
+	gpus := []ml.DeviceInfo{{DeviceID: first, FreeMemory: 32 * format.GibiByte}, {DeviceID: second, FreeMemory: 20 * format.GibiByte}}
+	var calls int
+	s.newServerFn = func(_ ml.SystemInfo, selected []ml.DeviceInfo, model string, _ *gguf.Model, _, _ []string, opts api.Options, _ int, _ llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		calls++
+		require.Len(t, selected, 2)
+		require.Equal(t, "1,1", opts.LlamaCppTensorSplit)
+		require.Equal(t, "layer", opts.LlamaCppSplitMode)
+		if calls == 1 {
+			return &mockLlm{modelPath: model, loadErr: errors.New("CUDA out of memory")}, nil
+		}
+		return &mockLlm{modelPath: model}, nil
+	}
+	require.True(t, s.load(scenario.req, ml.SystemInfo{}, gpus, true))
+	require.Same(t, resident, s.findRunnerToUnloadOnGPUs(scenario.req.evictionTargets))
+	delete(s.loaded, "resident")
+	require.False(t, s.load(scenario.req, ml.SystemInfo{}, gpus, true))
+	require.Equal(t, 2, calls)
+	require.Contains(t, s.loaded, "unrelated")
 }
 
 func testIntPtr(v int) *int {
@@ -1830,10 +1958,10 @@ func TestDisableMmapForHostPressure(t *testing.T) {
 	), "when VRAM is tight, no-mmap could make partial CPU offload worse")
 }
 
-// TestSchedLoadCrashTriggersEvictAllAndRetry verifies that a post-spawn
-// Load() OOM while other models are resident signals evict-all-and-retry
+// TestSchedLoadCrashTriggersRelevantEviction verifies that a post-spawn
+// Load() OOM while other models are resident signals a targeted retry
 // on the first attempt, but fails fast on the second attempt.
-func TestSchedLoadCrashTriggersEvictAllAndRetry(t *testing.T) {
+func TestSchedLoadCrashTriggersRelevantEviction(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer done()
 	s := InitScheduler(ctx)
@@ -1851,6 +1979,7 @@ func TestSchedLoadCrashTriggersEvictAllAndRetry(t *testing.T) {
 	s.loaded["existing-model"] = &runnerRef{
 		llama:    &mockLlm{modelPath: "/fake/existing"},
 		modelKey: "existing-model",
+		gpus:     []ml.DeviceID{{Library: "Metal"}},
 	}
 	s.loadedMu.Unlock()
 
@@ -1964,6 +2093,7 @@ func TestSchedLoadOOMKeepsExplicitContextBeforeRetry(t *testing.T) {
 	s.loaded["existing-model"] = &runnerRef{
 		llama:    &mockLlm{modelPath: "/fake/existing"},
 		modelKey: "existing-model",
+		gpus:     []ml.DeviceID{{Library: "Metal"}},
 	}
 	s.loadedMu.Unlock()
 
@@ -2180,6 +2310,57 @@ type mockLlm struct {
 	// loadErr, if non-nil, is returned from Load() to simulate a post-spawn
 	// load failure (e.g. llama-server crashing due to under-predicted VRAM).
 	loadErr error
+}
+
+type mockOffloadLlm struct {
+	*mockLlm
+	full, known bool
+}
+
+func (s *mockOffloadLlm) FullGPUOffload() (bool, bool) { return s.full, s.known }
+
+func TestAutomaticSingleGPUFallback(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		loadErr     error
+		full, known bool
+		wantRetry   bool
+	}{
+		{name: "complete", full: true, known: true},
+		{name: "partial", known: true, wantRetry: true},
+		{name: "unknown"},
+		{name: "out of memory", loadErr: errors.New("cudaMalloc: out of memory"), wantRetry: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OLLAMA_SCHED_SPREAD", "0")
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			s := InitScheduler(ctx)
+			scenario := newScenarioRequest(t, ctx, "fallback", 0, nil, nil)
+			gpus := []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, FreeMemory: 32 * format.GibiByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, FreeMemory: 24 * format.GibiByte},
+			}
+			s.getGpuFn = func(context.Context, []ml.FilteredRunnerDiscovery) []ml.DeviceInfo { return slices.Clone(gpus) }
+			s.getSystemInfoFn = func() ml.SystemInfo { return ml.SystemInfo{} }
+			var calls []int
+			first := &mockOffloadLlm{mockLlm: &mockLlm{modelPath: scenario.req.model.ModelPath, loadErr: tc.loadErr}, full: tc.full, known: tc.known}
+			s.newServerFn = func(_ ml.SystemInfo, devices []ml.DeviceInfo, model string, _ *gguf.Model, _, _ []string, _ api.Options, _ int, _ llm.LlamaServerConfig) (llm.LlamaServer, error) {
+				calls = append(calls, len(devices))
+				if len(calls) == 1 {
+					return first, nil
+				}
+				return &mockLlm{modelPath: model}, nil
+			}
+			require.False(t, s.load(scenario.req, ml.SystemInfo{}, gpus, false))
+			if tc.wantRetry {
+				require.Equal(t, []int{1, 2}, calls)
+				require.True(t, first.closeCalled.Load())
+			} else {
+				require.Equal(t, []int{1}, calls)
+			}
+		})
+	}
 }
 
 func (s *mockLlm) ModelPath() string {

@@ -41,7 +41,12 @@ type LlmRequest struct {
 
 	// oomRetryAttempted is set after a llama-server load crash triggers an
 	// evict-all-and-retry. Prevents infinite retry on persistent load failures.
-	oomRetryAttempted bool
+	oomRetryAttempted       bool
+	placementRetryAttempted bool
+	placementRetryLibrary   string
+	evictionTargets         []ml.DeviceID
+	targetedOOMRetry        bool
+	retryWithoutEviction    bool
 
 	// numCtxAuto is true when NumCtx came from Ollama's automatic VRAM-tier
 	// default rather than explicit request, model, or environment config.
@@ -285,6 +290,9 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			logutil.Trace("processing incoming request", "model", pending.model.ModelPath)
 
 			for {
+				if pending.ctx.Err() != nil {
+					break
+				}
 				var runnerToExpire *runnerRef
 				pendingKey := schedulerModelKey(pending.model)
 				s.loadedMu.Lock()
@@ -357,19 +365,16 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						break
 					}
 
-					// OOM retry path: load() crashed post-spawn and we still
-					// have other models resident. Evict all of them, wait for
-					// every unload, then loop back to retry the load once.
-					// load() has already set oomRetryAttempted so a second
-					// crash falls through to the fail-fast path.
-					if pending.oomRetryAttempted {
-						if !s.evictAllAndWait(ctx, pendingKey) {
-							return
-						}
+					if pending.retryWithoutEviction {
+						pending.retryWithoutEviction = false
 						continue
 					}
 
-					runnerToExpire = s.findRunnerToUnload()
+					if len(pending.evictionTargets) > 0 {
+						runnerToExpire = s.findRunnerToUnloadOnGPUs(pending.evictionTargets)
+					} else {
+						runnerToExpire = s.findRunnerToUnload()
+					}
 				}
 
 				if runnerToExpire == nil {
@@ -396,6 +401,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				case <-ctx.Done():
 					slog.Debug("shutting down scheduler pending loop")
 					return
+				case <-pending.ctx.Done():
+					continue
 				case <-s.unloadedCh:
 					slog.Debug("unload completed", "runner", runnerToExpire)
 					continue
@@ -563,6 +570,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	var f *gguf.Model
 	loadGpus := gpus
 	var launchOpts api.Options
+	var placementEstimate uint64
 
 	if llama == nil {
 		var err error
@@ -576,44 +584,55 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				return false
 			}
 
-			predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-			predicted := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
-			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
-			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
-			launchOpts.NumBatch = req.opts.NumBatch
-			var batchMemory uint64
-			launchOpts.NumBatch, batchMemory = llm.LlamaServerBatch(f, launchOpts, completion)
+			predictedCtx := effectiveLlamaServerContext(req.opts, f, numParallel)
+			predicted := req.predictLlamaServerVRAM(f, predictedCtx, numParallel)
+			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, gpus, req.opts)
+			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, llm.LlamaServerFlashAttention(gpus), gpus)
+			predicted = req.predictLlamaServerVRAM(f, predictedCtx, numParallel)
+			batchForPlacement, batchMemory := llm.LlamaServerBatch(f, req.opts, completion)
+			uncertainty := llamaServerEstimateUncertainty(req, f)
+			predictedForPlacement := predicted + batchMemory + uncertainty
+			placementEstimate = predictedForPlacement
+			slog.Info("estimating llama-server placement", "model", req.model.ModelPath,
+				"context", predictedCtx, "predicted", format.HumanBytes2(predicted),
+				"num_batch", batchForPlacement, "batch_allowance", format.HumanBytes2(batchMemory),
+				"uncertainty", format.HumanBytes2(uncertainty))
+			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predictedForPlacement, req.opts)
+			if req.placementRetryAttempted {
+				for _, group := range ml.ByLibrary(gpus) {
+					if group[0].Library == req.placementRetryLibrary {
+						loadGpus = group
+						break
+					}
+				}
+				launchOpts = req.opts
+			}
+			launchOpts.NumBatch = batchForPlacement
 			predictedForLoad := predicted + batchMemory
 
-			// Pre-flight check: estimate whether the model fits in remaining memory.
-			// llama-server auto-detects layers based on available VRAM, so if
-			// we predict it won't fit, evict before spawning.
-			if requireFull && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(loadGpus) > 0 {
-				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-				// Use 80% of free memory as threshold to leave headroom.
-				if predictedForLoad > freeMemory*80/100 || !tensorSplitFits(systemInfo, loadGpus, launchOpts, predictedForLoad) {
-					slog.Info("llama-server model predicted to exceed available memory, evicting",
-						"predicted", format.HumanBytes2(predictedForLoad),
-						"predicted_num_ctx", predictedCtx,
-						"num_batch", launchOpts.NumBatch,
-						"available", format.HumanBytes2(freeMemory),
-						"gpu_free", format.HumanBytes2(gpuFreeMemory),
-						"system_free", format.HumanBytes2(systemInfo.FreeMemory),
-						"system_limited", systemLimited)
-					s.loadedMu.Unlock()
+			// One fit assessment supplies both placement and eviction. For a
+			// multi-device group, the actual distribution remains uncertain;
+			// only an aggregate shortage is a reason for preflight eviction.
+			required := predictedForLoad + uncertainty
+			targets := placementDeviceIDs(loadGpus, launchOpts)
+			participating := make([]ml.DeviceInfo, 0, len(loadGpus))
+			for _, gpu := range loadGpus {
+				if slices.Contains(targets, gpu.DeviceID) {
+					participating = append(participating, gpu)
+				}
+			}
+			if requireFull && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(participating) > 0 && !placementHasCapacity(systemInfo, participating, required) {
+				s.loadedMu.Unlock()
+				if req.ctx.Err() == nil && s.findRunnerToUnloadOnGPUs(targets) != nil {
+					req.evictionTargets = targets
+					slog.Info("placement requires GPU memory held by a loaded model", "model", req.model.ModelPath, "required", format.HumanBytes2(required), "devices", targets)
 					return true
 				}
-				slog.Info("llama-server model fits alongside existing models",
-					"predicted", format.HumanBytes2(predictedForLoad),
-					"predicted_num_ctx", predictedCtx,
-					"num_batch", launchOpts.NumBatch,
-					"available", format.HumanBytes2(freeMemory),
-					"gpu_free", format.HumanBytes2(gpuFreeMemory),
-					"system_free", format.HumanBytes2(systemInfo.FreeMemory),
-					"system_limited", systemLimited)
+				// No resident model can free the needed devices. Let the runner
+				// decide whether partial offload is possible.
+				s.loadedMu.Lock()
 			}
+			req.evictionTargets = nil
 
 			launchOpts = s.applyLlamaServerMmapDefaults(req, launchOpts, systemInfo, loadGpus, f, numParallel)
 			req.contextShift = resolveContextShift(req.shift, req.model)
@@ -671,6 +690,36 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	}
 
 	gpuIDs, err := llama.Load(req.ctx, systemInfo, loadGpus, requireFull)
+	autoSingle := !req.placementRetryAttempted && len(loadGpus) == 1 && hasCompatibleGPUGroup(gpus, loadGpus[0]) && req.opts.MainGPU == nil && req.opts.LlamaCppSplitMode == "" && req.opts.LlamaCppTensorSplit == "" && req.opts.NumGPU < 0 && !envconfig.SchedSpread()
+	if autoSingle && err == nil {
+		if status, ok := llama.(interface{ FullGPUOffload() (bool, bool) }); ok {
+			full, known := status.FullGPUOffload()
+			if known && !full {
+				slog.Info("single GPU offload incomplete; retrying with GPU group")
+				err = llm.ErrLoadRequiredFull
+			} else if !known {
+				slog.Warn("single GPU offload could not be verified; retaining loaded runner")
+			}
+		}
+	}
+	if autoSingle && (errors.Is(err, llm.ErrLoadRequiredFull) || llm.IsOutOfMemory(err)) {
+		slog.Info("retrying model load with GPU group", "model", req.model.ModelPath, "error", err)
+		llama.Close()
+		s.loadedMu.Lock()
+		s.activeLoading = nil
+		s.loadedMu.Unlock()
+		req.placementRetryAttempted = true
+		req.placementRetryLibrary = loadGpus[0].Library
+		s.loadedMu.Lock()
+		runners := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
+		for _, runner := range s.loaded {
+			runners = append(runners, runner)
+		}
+		s.loadedMu.Unlock()
+		refreshed := s.getGpuFn(req.ctx, runners)
+		s.updateFreeSpace(refreshed)
+		return s.load(req, s.getSystemInfoFn(), refreshed, requireFull)
+	}
 	if err != nil {
 		if errors.Is(err, llm.ErrLoadRequiredFull) {
 			if !requireFull {
@@ -692,9 +741,22 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		loadedCount := len(s.loaded)
 		s.loadedMu.Unlock()
 		otherLoaded := loadedCount > 0
+		if otherLoaded && llm.IsOutOfMemory(err) && explicitMultiGPUSplit(req.opts) {
+			targets := likelySplitShortfallDevices(systemInfo, loadGpus, launchOpts, placementEstimate)
+			if !req.targetedOOMRetry && req.ctx.Err() == nil && s.findRunnerToUnloadOnGPUs(targets) != nil {
+				req.targetedOOMRetry = true
+				req.evictionTargets = targets
+				slog.Warn("explicit split load ran out of memory; retrying after relevant eviction", "devices", targets)
+				return true
+			}
+			// Do not evict unrelated models or silently change explicit settings.
+			req.errCh <- err
+			return false
+		}
 		if !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
 			if oldNumCtx, effectiveNumCtx, newNumCtx, oldNumBatch, newNumBatch, ok := req.reduceAutoNumCtxForLoadOOM(f, numParallel, completion, systemInfo, loadGpus, launchOpts); ok {
 				req.oomRetryAttempted = true
+				req.retryWithoutEviction = true
 				slog.Warn("llama-server load failed; reducing automatic context and retrying once",
 					"model", req.model.ModelPath,
 					"old_num_ctx", oldNumCtx,
@@ -703,15 +765,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					"old_num_batch", oldNumBatch,
 					"new_num_batch", newNumBatch,
 					"loaded_count", loadedCount,
-					"evict_all", otherLoaded,
+					"evict_all", false,
 					"error", err)
 				return true
 			}
 		}
 		if otherLoaded && !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
-			req.oomRetryAttempted = true
-			slog.Warn("llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
-			return true
+			targets := placementDeviceIDs(loadGpus, launchOpts)
+			if req.ctx.Err() == nil && s.findRunnerToUnloadOnGPUs(targets) != nil {
+				req.oomRetryAttempted = true
+				req.evictionTargets = targets
+				slog.Warn("llama-server load failed; evicting a relevant model and retrying once", "model", req.model.ModelPath, "devices", targets, "error", err)
+				return true
+			}
 		}
 
 		req.errCh <- err
@@ -833,8 +899,8 @@ func (req *LlmRequest) reduceAutoNumCtxForLoadOOM(f *gguf.Model, numParallel int
 	}
 
 	req.opts.NumCtx = newNumCtx
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictedCtx := effectiveLlamaServerContext(req.opts, f, numParallel)
+	predictedVRAM := req.predictLlamaServerVRAM(f, predictedCtx, numParallel)
 	available, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	req.applyAutomaticGenerationBatch(completion, predictedCtx, predictedVRAM, available, llm.LlamaServerFlashAttention(gpus), gpus)
 	newNumBatch = req.opts.NumBatch
@@ -849,8 +915,47 @@ func explicitPartialGPUOffload(opts api.Options, f *gguf.Model) bool {
 	return uint64(opts.NumGPU) < f.KV().BlockCount()+1
 }
 
-func effectiveLlamaServerContext(numCtx int, f *gguf.Model, numParallel int) int {
-	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
+func effectiveLlamaServerContext(opts api.Options, f *gguf.Model, numParallel int) int {
+	if opts.LlamaCppCtxSize > 0 {
+		return opts.LlamaCppCtxSize * max(numParallel, 1)
+	}
+	return effectiveModelContext(opts.NumCtx, f) * max(numParallel, 1)
+}
+
+func (req *LlmRequest) predictLlamaServerVRAM(f *gguf.Model, ctx, parallel int) uint64 {
+	batch := req.opts.NumBatch
+	draftTokens := 0
+	if req.model.DraftPath != "" || f.KV().Uint("nextn_predict_layers") > 0 {
+		draftTokens = req.opts.DraftNumPredict
+	}
+	predicted := llm.PredictServerVRAMForOptions(req.model.ModelPath, f, ctx, parallel, batch, draftTokens)
+	for _, path := range req.model.ProjectorPaths {
+		if path != req.model.ModelPath {
+			predicted += modelFileSize(path)
+		}
+	}
+	if req.opts.DraftNumPredict > 0 && req.model.DraftPath != "" {
+		draft, err := llm.LoadModel(req.model.DraftPath, 1024, req.model.DraftShardPaths...)
+		if err != nil {
+			slog.Warn("unable to estimate draft model memory", "model", req.model.DraftPath, "error", err)
+		} else {
+			predicted += llm.PredictServerVRAMForOptions(req.model.DraftPath, draft, ctx, parallel, batch)
+		}
+	}
+	return predicted
+}
+
+// Reserve extra space for components whose runtime buffers are not represented
+// by their model files, and for architectures without a reviewed cache layout.
+func llamaServerEstimateUncertainty(req *LlmRequest, f *gguf.Model) uint64 {
+	var uncertainty uint64
+	if len(req.model.ProjectorPaths) > 0 || (req.opts.DraftNumPredict > 0 && (req.model.DraftPath != "" || f.KV().Uint("nextn_predict_layers") > 0)) {
+		uncertainty += format.GibiByte
+	}
+	if !slices.Contains([]string{"llama", "internlm2", "gemma3", "gemma4", "gpt-oss", "lfm3", "mistral3", "muse-glimmer", "nemotron_h_moe", "nomic-bert", "qwen2", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "phi3", "granite", "command-r"}, f.KV().Architecture()) {
+		uncertainty += 2 * format.GibiByte
+	}
+	return uncertainty
 }
 
 const (
@@ -1002,38 +1107,117 @@ func availableMemoryForPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo,
 	return availableMemoryForLoad(systemInfo, placementGpus)
 }
 
-// tensorSplitFits checks each device as well as the aggregate capacity. A
-// configured split can overload one GPU even when the group has ample VRAM.
-// The split is only an approximation of layer allocation, so retain the same
-// headroom used by the aggregate preflight.
-func tensorSplitFits(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, opts api.Options, predicted uint64) bool {
-	if opts.LlamaCppTensorSplit == "" || len(gpus) < 2 || opts.MainGPU != nil {
+func placementHasCapacity(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, predicted uint64) bool {
+	if len(gpus) == 0 || predicted == 0 {
 		return true
 	}
-	parts := strings.Split(opts.LlamaCppTensorSplit, ",")
-	weights := make([]float64, len(gpus))
-	var total float64
-	for i, part := range parts {
-		value, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
-		if err != nil || i >= len(gpus) {
-			return true // Let llama-server handle invalid configurations.
-		}
-		weights[i] = float64(value)
-		total += weights[i]
-	}
-	if total == 0 {
-		return true // llama.cpp chooses its own split when all weights are zero.
-	}
-	for i, gpu := range gpus {
-		if float64(predicted)*weights[i]/total > float64(availableMemoryForGPU(systemInfo, gpu))*0.8 {
+	available, _, _ := availableMemoryForLoad(systemInfo, gpus)
+	for _, gpu := range gpus {
+		reserve := uint64(format.GibiByte) + envconfig.GpuOverhead() + gpu.MinimumMemory()
+		if available <= reserve {
 			return false
 		}
+		available -= reserve
 	}
-	return true
+	return predicted <= available
+}
+
+func placementDeviceIDs(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceID {
+	parts := strings.Split(opts.LlamaCppTensorSplit, ",")
+	useWeights := opts.LlamaCppTensorSplit != "" && len(parts) == len(gpus)
+	weights := make([]uint64, len(gpus))
+	var sum uint64
+	if useWeights {
+		for i, part := range parts {
+			value, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+			if err != nil {
+				useWeights = false
+				break
+			}
+			weights[i] = value
+			sum += value
+		}
+	}
+	var ids []ml.DeviceID
+	for i, gpu := range gpus {
+		if !useWeights || sum == 0 || weights[i] > 0 || (opts.MainGPU != nil && *opts.MainGPU == i) {
+			ids = append(ids, gpu.DeviceID)
+		}
+	}
+	return ids
+}
+
+// The proportional split is only a hint. Use it to select which loaded model
+// may help after an actual OOM, never as proof that the placement cannot fit.
+func likelySplitShortfallDevices(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, opts api.Options, predicted uint64) []ml.DeviceID {
+	fallback := placementDeviceIDs(gpus, opts)
+	parts := strings.Split(opts.LlamaCppTensorSplit, ",")
+	if opts.LlamaCppTensorSplit == "" || len(parts) != len(gpus) || predicted == 0 {
+		return fallback
+	}
+	weights := make([]uint64, len(parts))
+	var sum uint64
+	for i, part := range parts {
+		value, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+		if err != nil || value > math.MaxUint64-sum {
+			return fallback
+		}
+		weights[i] = value
+		sum += value
+	}
+	if sum == 0 {
+		return fallback
+	}
+	var short []ml.DeviceID
+	for i, gpu := range gpus {
+		if weights[i] == 0 {
+			continue
+		}
+		share := float64(predicted) * float64(weights[i]) / float64(sum)
+		free := availableMemoryForGPU(systemInfo, gpu)
+		reserve := uint64(format.GibiByte) + envconfig.GpuOverhead() + gpu.MinimumMemory()
+		if free <= reserve || share > float64(free-reserve) {
+			short = append(short, gpu.DeviceID)
+		}
+	}
+	if len(short) == 0 {
+		return fallback
+	}
+	return short
+}
+
+func explicitMultiGPUSplit(opts api.Options) bool {
+	return opts.LlamaCppSplitMode == "layer" || opts.LlamaCppSplitMode == "row" || (opts.MainGPU == nil && opts.LlamaCppSplitMode == "" && opts.LlamaCppTensorSplit != "")
+}
+
+func hasCompatibleGPUGroup(gpus []ml.DeviceInfo, selected ml.DeviceInfo) bool {
+	for _, group := range ml.ByLibrary(gpus) {
+		if len(group) > 1 && group[0].Library == selected.Library {
+			return true
+		}
+	}
+	return false
+}
+
+func bestSingleGPUWithHeadroom(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predicted uint64) (gpu ml.DeviceInfo, ok bool) {
+	var available uint64
+	for _, group := range groups {
+		for _, candidate := range group {
+			free := availableMemoryForGPU(systemInfo, candidate)
+			headroom := uint64(format.GibiByte) + envconfig.GpuOverhead() + candidate.MinimumMemory()
+			if free < headroom || predicted > free-headroom {
+				continue
+			}
+			if !ok || betterPlacementGPU(candidate, free, gpu, available) {
+				gpu, available, ok = candidate, free, true
+			}
+		}
+	}
+	return gpu, ok
 }
 
 func gpusForPlacement(gpus []ml.DeviceInfo, opts api.Options) []ml.DeviceInfo {
-	if opts.MainGPU != nil && *opts.MainGPU >= 0 && *opts.MainGPU < len(gpus) {
+	if !explicitMultiGPUSplit(opts) && opts.MainGPU != nil && *opts.MainGPU >= 0 && *opts.MainGPU < len(gpus) {
 		return []ml.DeviceInfo{gpus[*opts.MainGPU]}
 	}
 
@@ -1049,6 +1233,11 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 	groups := ml.ByLibrary(gpus)
 	if len(groups) == 0 {
 		return gpus, launchOpts
+	}
+	if explicitMultiGPUSplit(opts) {
+		selected := bestGPUGroupByAvailableMemory(systemInfo, groups)
+		logSelectedGPUGroup(gpus, selected)
+		return selected, launchOpts
 	}
 
 	if opts.MainGPU != nil {
@@ -1077,9 +1266,10 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		return selected, launchOpts
 	}
 
-	if !envconfig.SchedSpread() && predictedVRAM > 0 {
-		gpu, available, ok := bestSingleGPUFit(systemInfo, groups, predictedVRAM)
+	if !envconfig.SchedSpread() && predictedVRAM > 0 && opts.NumGPU < 0 && opts.LlamaCppSplitMode == "" {
+		gpu, ok := bestSingleGPUWithHeadroom(systemInfo, groups, predictedVRAM)
 		if ok {
+			available := availableMemoryForGPU(systemInfo, gpu)
 			selected, launchOpts := singleLlamaServerGPUPlacement(gpu, launchOpts)
 			slog.Info("selecting single GPU for llama-server model",
 				"main_gpu", *launchOpts.MainGPU,
@@ -1122,24 +1312,6 @@ func bestExplicitMainGPU(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, mai
 			gpu = candidate
 			available = candidateAvailable
 			ok = true
-		}
-	}
-
-	return gpu, available, ok
-}
-
-func bestSingleGPUFit(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predictedVRAM uint64) (gpu ml.DeviceInfo, available uint64, ok bool) {
-	for _, group := range groups {
-		for _, candidate := range group {
-			candidateAvailable := availableMemoryForGPU(systemInfo, candidate)
-			if predictedVRAM > candidateAvailable*80/100 {
-				continue
-			}
-			if !ok || betterPlacementGPU(candidate, candidateAvailable, gpu, available) {
-				gpu = candidate
-				available = candidateAvailable
-				ok = true
-			}
 		}
 	}
 
@@ -1207,8 +1379,8 @@ func logSelectedGPUGroup(all, selected []ml.DeviceInfo) {
 }
 
 func (s *Scheduler) applyLlamaServerMmapDefaults(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) api.Options {
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictedCtx := effectiveLlamaServerContext(req.opts, f, numParallel)
+	predictedVRAM := req.predictLlamaServerVRAM(f, predictedCtx, numParallel)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 
 	if reason := disableMmapDefaultReason(runtime.GOOS, req.opts, gpus, f.KV().BlockCount(), predictedVRAM, availableVRAM); reason != "" {
@@ -1271,8 +1443,8 @@ func allDevicesLibrary(gpus []ml.DeviceInfo, library string) bool {
 func (s *Scheduler) maybeDisableMmapForHostPressure(req *LlmRequest, launchOpts api.Options, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *gguf.Model, numParallel int) {
 	modelSize := modelFileSize(req.model.modelPaths()...)
 	loadedMmapSize := s.loadedMmapModelSizeLocked()
-	predictedCtx := effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-	predictedVRAM := llm.PredictServerVRAM(req.model.ModelPath, f, predictedCtx)
+	predictedCtx := effectiveLlamaServerContext(req.opts, f, numParallel)
+	predictedVRAM := req.predictLlamaServerVRAM(f, predictedCtx, numParallel)
 	availableVRAM, _, _ := availableMemoryForPlacement(systemInfo, gpus, launchOpts)
 	placementGpus := gpusForPlacement(gpus, launchOpts)
 
@@ -1783,6 +1955,47 @@ func (s *Scheduler) findRunnerToUnload() *runnerRef {
 	// None appear idle, just wait for the one with the shortest duration
 	slog.Debug("no idle runners, picking the shortest duration", "runner_count", len(runnerList), "runner", runnerList[0])
 	return runnerList[0]
+}
+
+// findRunnerToUnloadOnGPUs avoids unloading a model that cannot free space on
+// the placement's devices. Prefer idle runners, then the existing duration order.
+func (s *Scheduler) findRunnerToUnloadOnGPUs(targets []ml.DeviceID) *runnerRef {
+	s.loadedMu.Lock()
+	runners := make([]*runnerRef, 0, len(s.loaded))
+	for _, runner := range s.loaded {
+		runners = append(runners, runner)
+	}
+	s.loadedMu.Unlock()
+	sort.Sort(ByDurationAndName(runners))
+	var active *runnerRef
+	for _, runner := range runners {
+		runner.refMu.Lock()
+		relevant := false
+		knownUsage := false
+		if runner.llama != nil {
+			for _, id := range runner.gpus {
+				if runner.llama.VRAMByGPU(id) > 0 {
+					knownUsage = true
+					break
+				}
+			}
+		}
+		for _, id := range targets {
+			if (runner.llama != nil && runner.llama.VRAMByGPU(id) > 0) || (!knownUsage && slices.Contains(runner.gpus, id)) {
+				relevant = true
+				break
+			}
+		}
+		idle := runner.refCount == 0
+		runner.refMu.Unlock()
+		if relevant && idle {
+			return runner
+		}
+		if relevant && active == nil {
+			active = runner
+		}
+	}
+	return active
 }
 
 func (s *Scheduler) unloadAllRunners() {

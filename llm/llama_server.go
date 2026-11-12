@@ -158,6 +158,7 @@ type llamaServerRunner struct {
 	memModelFileBacked uint64 // model weight bytes whose buffers mirror the on-disk file (mmap views + direct device copies); excludes repacked copies like CPU_REPACK
 	memCPUMappedModel  uint64 // model weight bytes in mmap-backed CPU buffers (e.g. CPU_Mapped), parsed from llama-server logs
 	gpuLayers          uint64 // model layers loaded on GPU, parsed from llama-server logs
+	offloadReported    bool   // a final layer-offload count was observed
 	gpuLayerOverflow   int    // number of GPU-selected layers partially overflowed to CPU
 	status             *StatusWriter
 	options            api.Options
@@ -1192,7 +1193,7 @@ func (s *llamaServerRunner) Load(ctx context.Context, systemInfo ml.SystemInfo, 
 			"model", s.modelPath, "gpus", len(s.gpus))
 	}
 
-	if s.options.MainGPU != nil && *s.options.MainGPU >= 0 && *s.options.MainGPU < len(gpus) {
+	if s.options.MainGPU != nil && s.options.LlamaCppSplitMode != "layer" && s.options.LlamaCppSplitMode != "row" && *s.options.MainGPU >= 0 && *s.options.MainGPU < len(gpus) {
 		return []ml.DeviceID{gpus[*s.options.MainGPU].DeviceID}, nil
 	}
 
@@ -1248,6 +1249,7 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	s.memModelFileBacked = 0
 	s.memCPUMappedModel = 0
 	s.gpuLayers = 0
+	s.offloadReported = false
 	s.gpuLayerOverflow = 0
 	for k := range s.vramByDevice {
 		delete(s.vramByDevice, k)
@@ -1258,6 +1260,24 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	if s.status != nil {
 		s.status.SetLastError("")
 	}
+}
+
+// FullGPUOffload reports whether a runner emitted a usable layer-offload count.
+func (s *llamaServerRunner) FullGPUOffload() (full, known bool) {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	if !s.offloadReported || s.totalLayers == 0 {
+		return false, false
+	}
+	if s.gpuLayers < s.totalLayers {
+		return false, true
+	}
+	// Fit-probe overflow lines are not final offload results. A reported full
+	// layer count together with overflow cannot establish the final tensor layout.
+	if s.gpuLayerOverflow > 0 {
+		return false, false
+	}
+	return true, true
 }
 
 func (s *llamaServerRunner) hasParsedVRAM() bool {
@@ -2928,30 +2948,131 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 // Uses model file size as a proxy for weights plus a rough KV cache estimate.
 // This is intentionally conservative — it overestimates to avoid VRAM contention.
 func PredictServerVRAM(modelPath string, f *gguf.Model, numCtx int) uint64 {
+	return PredictServerVRAMForOptions(modelPath, f, numCtx, 1, 0)
+}
+
+// PredictServerVRAMForOptions uses the runner's total context, parallel slots
+// and physical batch to estimate the cache allocation. Unknown cache layouts
+// are deliberately counted at full context.
+func PredictServerVRAMForOptions(modelPath string, f *gguf.Model, numCtx, numParallel, numBatch int, draftTokens ...int) uint64 {
 	weights := modelFileSize(modelPath, f)
 
-	// KV cache: 2 (K+V) * layers * kv_heads * head_dim * context * 2 bytes (f16)
-	layers := f.KV().BlockCount()
-	// Hybrid SSM/attention models (e.g. qwen35) only keep per-token KV caches on
-	// every Nth layer; the rest use fixed-size recurrent state independent of
-	// context length. Counting all layers inflates the estimate and can push
-	// placement off a single GPU that would actually fit the model.
-	if kv := f.KV().KeyValue("full_attention_interval"); kv.Valid() {
-		if n := kv.Uint(); n > 1 {
-			layers = (layers + n - 1) / n
+	if numCtx <= 0 {
+		return weights
+	}
+	kv := f.KV()
+	if kv.Architecture() == "nomic-bert" {
+		return weights // llama.cpp does not allocate a persistent KV cache
+	}
+	layers := kv.BlockCount()
+	if next := kv.Uint("nextn_predict_layers"); next < layers {
+		layers -= next
+	}
+	if kv.Architecture() == "gemma4" {
+		shared := kv.Uint("attention.shared_kv_layers")
+		if shared < layers {
+			layers -= shared
 		}
 	}
-	kvHeads := f.KV().HeadCountKVMin()
-	if kvHeads == 0 {
-		kvHeads = 1
-	}
+	kvHeads := kv.Uint("attention.head_count_kv", kv.HeadCountMax())
+	headCounts := kv.KeyValue("attention.head_count_kv").Uints()
+	feedForward := kv.KeyValue("feed_forward_length").Uints()
 	headDim := uint64(0)
 	if f.KV().HeadCountMax() > 0 {
 		headDim = f.KV().EmbeddingLength() / f.KV().HeadCountMax()
 	}
-	kvCache := 2 * layers * kvHeads * headDim * uint64(numCtx) * 2
+	keyDim := kv.Uint("attention.key_length", headDim)
+	valueDim := kv.Uint("attention.value_length", headDim)
+	windowPattern := kv.KeyValue("attention.sliding_window_pattern").Bools()
+	window := kv.Uint("attention.sliding_window")
+	windowInterval := kv.Uint("attention.sliding_window_pattern")
+	if windowInterval == 0 && len(windowPattern) == 0 {
+		switch kv.Architecture() {
+		case "gemma3":
+			windowInterval = 6
+		case "gpt-oss":
+			windowInterval = 2
+		case "muse-glimmer":
+			windowInterval = 4
+		}
+	}
+	parallel := uint64(max(numParallel, 1))
+	ctxPerSlot := (uint64(numCtx) + parallel - 1) / parallel
+	ctxPerSlot = (ctxPerSlot + 255) / 256 * 256
+	fullCtx := ctxPerSlot * parallel
+	batch := uint64(numBatch)
+	if numBatch <= 0 {
+		batch = 512 // llama-server's default physical batch
+	}
+	windowCtx := fullCtx
+	if window > 0 {
+		windowCtx = ((min(ctxPerSlot, window+batch) + 255) / 256 * 256) * parallel
+	}
+	interval := kv.Uint("full_attention_interval")
+	cacheBytes := uint64(2)
+	if strings.EqualFold(envconfig.KvCacheType(), "f32") {
+		cacheBytes = 4
+	}
+	var kvCache, recurrentLayers uint64
+	for i := uint64(0); i < layers; i++ {
+		heads := kvHeads
+		if len(headCounts) > int(i) {
+			heads = headCounts[i]
+		} else if interval > 1 && (i+1)%interval != 0 {
+			recurrentLayers++
+			continue
+		}
+		if heads == 0 {
+			// Nemotron interleaves separate feed-forward layers with recurrent
+			// layers; only the latter allocate recurrent state.
+			if kv.Architecture() != "nemotron_h_moe" || int(i) >= len(feedForward) || feedForward[i] == 0 {
+				recurrentLayers++
+			}
+			continue
+		}
+		k, v := keyDim, valueDim
+		isWindow := int(i) < len(windowPattern) && windowPattern[i]
+		if len(windowPattern) == 0 && windowInterval > 0 {
+			isWindow = i%windowInterval < windowInterval-1
+		}
+		if isWindow {
+			k = kv.Uint("attention.key_length_swa", k)
+			v = kv.Uint("attention.value_length_swa", v)
+		}
+		ctx := fullCtx
+		if isWindow {
+			ctx = windowCtx
+		}
+		kvCache += heads * (k + v) * ctx * cacheBytes
+	}
+	var recurrent uint64
+	if kv.Architecture() == "qwen35" || kv.Architecture() == "qwen35moe" || kv.Architecture() == "nemotron_h_moe" {
+		conv, inner := kv.Uint("ssm.conv_kernel"), kv.Uint("ssm.inner_size")
+		state, groups := kv.Uint("ssm.state_size"), kv.Uint("ssm.group_count")
+		if conv > 0 {
+			recurrent = recurrentLayers * parallel * 4 * ((conv-1)*(inner+2*groups*state) + state*inner)
+		}
+	} else if kv.Architecture() == "lfm3" {
+		if n := kv.Uint("shortconv.l_cache"); n > 0 {
+			recurrent = recurrentLayers * parallel * 4 * kv.EmbeddingLength() * (n - 1)
+		}
+	}
+	if len(draftTokens) > 0 && draftTokens[0] > 0 {
+		// Speculative decoding retains rollback snapshots for recurrent state.
+		recurrent *= uint64(1 + draftTokens[0])
+		// MTP uses a separate context for the appended attention layers.
+		if next := kv.Uint("nextn_predict_layers"); next > 0 {
+			for i := kv.BlockCount() - min(next, kv.BlockCount()); i < kv.BlockCount(); i++ {
+				heads := kvHeads
+				if int(i) < len(headCounts) {
+					heads = headCounts[i]
+				}
+				kvCache += heads * (keyDim + valueDim) * fullCtx * cacheBytes
+			}
+		}
+	}
 
-	return weights + kvCache
+	return weights + kvCache + recurrent
 }
 
 // memoryParsingWriter wraps an io.Writer and parses llama-server log output
@@ -3046,6 +3167,7 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 				if loadedErr == nil && totalErr == nil {
 					w.runner.gpuLayers = loaded
 					w.runner.totalLayers = total
+					w.runner.offloadReported = true
 				}
 			}
 			for _, match := range fitOverflowingLayersRegex.FindAllSubmatch(b, -1) {

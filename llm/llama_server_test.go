@@ -3356,6 +3356,21 @@ func TestMemoryParsingWriterConcurrentReads(t *testing.T) {
 	}
 }
 
+func TestFullGPUOffloadDoesNotTreatProbeOverflowAsFinal(t *testing.T) {
+	runner := &llamaServerRunner{}
+	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+	_, _ = w.Write([]byte("common_params_fit_impl:   - ROCm0: 25 layers ( 5 overflowing), 100 MiB used\n"))
+	_, _ = w.Write([]byte("llm_load_tensors: offloaded 25/25 layers to GPU\n"))
+	if full, known := runner.FullGPUOffload(); full || known {
+		t.Fatalf("probe overflow with full layer count = (%v, %v), want unknown", full, known)
+	}
+	runner.resetLoadAccounting()
+	_, _ = w.Write([]byte("llm_load_tensors: offloaded 10/25 layers to GPU\n"))
+	if full, known := runner.FullGPUOffload(); full || !known {
+		t.Fatalf("partial offload = (%v, %v), want confirmed partial", full, known)
+	}
+}
+
 func TestMemoryParsingWriterMemorySizeFullOffload(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -3604,10 +3619,10 @@ func TestPredictServerVRAMHybridFullAttentionInterval(t *testing.T) {
 		heads   = 16
 	)
 	kvBase := gguftest.KV{
-		"general.architecture":         "qwen35",
-		"qwen35.block_count":           uint32(blocks),
-		"qwen35.embedding_length":      uint32(embd),
-		"qwen35.attention.head_count":  uint32(heads),
+		"general.architecture":           "qwen35",
+		"qwen35.block_count":             uint32(blocks),
+		"qwen35.embedding_length":        uint32(embd),
+		"qwen35.attention.head_count":    uint32(heads),
 		"qwen35.attention.head_count_kv": uint32(kvHeads),
 	}
 
@@ -3633,9 +3648,117 @@ func TestPredictServerVRAMHybridFullAttentionInterval(t *testing.T) {
 	}
 	kvHybrid["qwen35.full_attention_interval"] = uint32(4)
 	hybridPath, hybrid := writeTestGGUF(t, kvHybrid, nil)
-	wantHybrid := hybrid.FileSize() + kvTerm(9)
+	wantHybrid := hybrid.FileSize() + kvTerm(8)
 	if got := PredictServerVRAM(hybridPath, hybrid, numCtx); got != wantHybrid {
 		t.Fatalf("hybrid prediction = %d, want %d", got, wantHybrid)
+	}
+}
+
+func TestPredictServerVRAMExplicitAttentionDimensions(t *testing.T) {
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":             "mistral3",
+		"mistral3.block_count":             uint32(40),
+		"mistral3.embedding_length":        uint32(5120),
+		"mistral3.attention.head_count":    uint32(32),
+		"mistral3.attention.head_count_kv": uint32(8),
+		"mistral3.attention.key_length":    uint32(128),
+		"mistral3.attention.value_length":  uint32(128),
+	}, nil)
+	const context = 32768
+	want := model.FileSize() + uint64(40*8*(128+128)*context*2)
+	if got := PredictServerVRAM(path, model, context); got != want {
+		t.Fatalf("prediction = %d, want %d", got, want)
+	}
+}
+
+func TestPredictServerVRAMPerLayerAndDraft(t *testing.T) {
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":           "qwen35",
+		"qwen35.block_count":             uint32(5),
+		"qwen35.nextn_predict_layers":    uint32(1),
+		"qwen35.embedding_length":        uint32(512),
+		"qwen35.attention.head_count":    uint32(8),
+		"qwen35.attention.head_count_kv": []uint32{0, 4, 0, 4, 4},
+		"qwen35.attention.key_length":    uint32(128),
+		"qwen35.attention.value_length":  uint32(128),
+	}, nil)
+	want := model.FileSize() + uint64(2*4*(128+128)*4096*2)
+	if got := PredictServerVRAM(path, model, 4096); got != want {
+		t.Fatalf("prediction = %d, want %d", got, want)
+	}
+	draftKV := uint64(4 * (128 + 128) * 4096 * 2)
+	if got := PredictServerVRAMForOptions(path, model, 4096, 1, 512, 4); got != want+draftKV {
+		t.Fatalf("prediction with draft = %d, want %d", got, want+draftKV)
+	}
+}
+
+func TestPredictServerVRAMEmbeddingHasNoKVCache(t *testing.T) {
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":            "nomic-bert",
+		"nomic-bert.block_count":          uint32(12),
+		"nomic-bert.embedding_length":     uint32(768),
+		"nomic-bert.attention.head_count": uint32(12),
+	}, nil)
+	if got := PredictServerVRAM(path, model, 8192); got != model.FileSize() {
+		t.Fatalf("prediction = %d, want weights %d", got, model.FileSize())
+	}
+}
+
+func TestPredictServerVRAMSlidingWindowAndParallel(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_TYPE", "f16")
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":                    "gemma4",
+		"gemma4.block_count":                      uint32(4),
+		"gemma4.embedding_length":                 uint32(512),
+		"gemma4.attention.head_count":             uint32(8),
+		"gemma4.attention.head_count_kv":          []uint32{4, 4, 2, 2},
+		"gemma4.attention.key_length":             uint32(128),
+		"gemma4.attention.value_length":           uint32(128),
+		"gemma4.attention.key_length_swa":         uint32(64),
+		"gemma4.attention.value_length_swa":       uint32(64),
+		"gemma4.attention.sliding_window":         uint32(1024),
+		"gemma4.attention.sliding_window_pattern": []bool{true, true, false, false},
+		"gemma4.attention.shared_kv_layers":       uint32(1),
+	}, nil)
+	// Two slots: two sliding layers use 1024+512 cells per slot; one
+	// non-sliding layer uses 8192 cells per slot. The last layer reuses KV.
+	wantKV := uint64(2*4*(64+64)*(1024+512)*2*2 + 2*(128+128)*8192*2*2)
+	if got := PredictServerVRAMForOptions(path, model, 16384, 2, 512); got != model.FileSize()+wantKV {
+		t.Fatalf("prediction = %d, want %d", got, model.FileSize()+wantKV)
+	}
+}
+
+func TestPredictServerVRAMGptOssAlternatingWindow(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_TYPE", "f16")
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":             "gpt-oss",
+		"gpt-oss.block_count":              uint32(24),
+		"gpt-oss.embedding_length":         uint32(2880),
+		"gpt-oss.attention.head_count":     uint32(64),
+		"gpt-oss.attention.head_count_kv":  uint32(8),
+		"gpt-oss.attention.key_length":     uint32(64),
+		"gpt-oss.attention.value_length":   uint32(64),
+		"gpt-oss.attention.sliding_window": uint32(128),
+	}, nil)
+	// The runner pads the 128-token window plus 512-token batch to 768.
+	wantKV := uint64(12 * 8 * (64 + 64) * (768 + 32768) * 2)
+	if got := PredictServerVRAMForOptions(path, model, 32768, 1, 512); got != model.FileSize()+wantKV {
+		t.Fatalf("prediction = %d, want %d", got, model.FileSize()+wantKV)
+	}
+}
+
+func TestPredictServerVRAMF32Cache(t *testing.T) {
+	t.Setenv("OLLAMA_KV_CACHE_TYPE", "f32")
+	path, model := writeTestGGUF(t, gguftest.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(2),
+		"llama.embedding_length":        uint32(512),
+		"llama.attention.head_count":    uint32(8),
+		"llama.attention.head_count_kv": uint32(4),
+	}, nil)
+	wantKV := uint64(2 * 4 * (64 + 64) * 4096 * 4)
+	if got := PredictServerVRAMForOptions(path, model, 4096, 1, 512); got != model.FileSize()+wantKV {
+		t.Fatalf("prediction = %d, want %d", got, model.FileSize()+wantKV)
 	}
 }
 
